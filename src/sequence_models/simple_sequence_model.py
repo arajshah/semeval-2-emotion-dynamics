@@ -53,3 +53,91 @@ class SimpleSequenceRegressor(nn.Module):
         preds = self.fc(last_hidden)
         return preds
 
+
+class TransformerSequenceRegressor(nn.Module):
+    """
+    Transformer-based sequence regressor for predicting ΔV/ΔA from embedding sequences.
+
+    Inputs:
+        - inputs:  (B, L, D) float tensor of embeddings (padded on the left)
+        - lengths: (B,) long tensor of actual sequence lengths (<= L)
+
+    Output:
+        - preds: (B, 2) predictions for [ΔV, ΔA]
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        nhead: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+
+        if hidden_dim != embedding_dim:
+            self.input_proj = nn.Linear(embedding_dim, hidden_dim)
+        else:
+            self.input_proj = nn.Identity()
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=nhead,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+        )
+
+        self.fc = nn.Linear(hidden_dim, 2)
+
+    def forward(
+        self,
+        inputs: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            inputs:  (B, L, D)
+            lengths: (B,) with actual sequence lengths, or None
+
+        Returns:
+            preds: (B, 2)
+        """
+        B, L, _ = inputs.shape
+
+        x = self.input_proj(inputs)
+
+        if lengths is not None:
+            mask = torch.ones((B, L), dtype=torch.bool, device=inputs.device)
+            for i in range(B):
+                valid_len = int(lengths[i].item())
+                if valid_len <= 0:
+                    continue
+                mask[i, L - valid_len :] = False
+        else:
+            mask = None
+
+        encoded = self.encoder(x, src_key_padding_mask=mask)
+
+        if lengths is not None:
+            pooled = torch.zeros((B, self.hidden_dim), device=encoded.device)
+            for i in range(B):
+                valid_len = int(lengths[i].item())
+                if valid_len <= 0:
+                    continue
+                start = L - valid_len
+                pooled[i] = encoded[i, start:].mean(dim=0)
+        else:
+            pooled = encoded.mean(dim=1)
+
+        preds = self.fc(pooled)
+        return preds
+
