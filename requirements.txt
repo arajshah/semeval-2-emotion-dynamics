@@ -1,0 +1,11 @@
+# Python dependencies for SemEval Task 2 project
+
+numpy
+pandas
+scikit-learn
+matplotlib
+sentence-transformers
+torch
+pyarrow
+jupyter
+ipykernel

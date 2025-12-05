@@ -1,0 +1,21 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS artifacts
+.DS_Store
+
+# Derived artifacts (keep raw data tracked if desired)
+data/processed/
+data/raw/
+models/
+
