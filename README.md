@@ -73,5 +73,3 @@ The repository currently includes:
 - LSTM-based sequence model for Subtask 2A.
 - Evaluation utilities and trajectory visualization notebook.
 
-For detailed commands, artifacts, and metric snapshots, see [`handover_notes.md`](./handover_notes.md).
-
