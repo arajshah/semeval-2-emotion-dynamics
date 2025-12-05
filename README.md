@@ -1,6 +1,6 @@
 # SemEval 2026 Task 2 — Emotion Dynamics
 
-Code, baselines, and models for SemEval 2026 Task 2: predicting variation in emotional valence and arousal over time from ecological essays. The current focus covers Subtask 1 (per-entry valence/arousal) and Subtask 2A (state-change ΔV/ΔA), with pipelines for data loading, baselines, embeddings, sequence modeling, and evaluation.
+Code, baselines, and models for SemEval 2026 Task 2: Predicting Variation in Emotional Valence and Arousal over Time from Ecological Essays. The repository currently focuses on Subtask 1 (per-entry valence/arousal) and Subtask 2A (state-change ΔV/ΔA), with initial baselines for Subtask 2B (disposition change), and provides pipelines for data loading, feature extraction, baselines, embeddings, sequence modeling, and evaluation.
 
 ## Setup & Installation
 
