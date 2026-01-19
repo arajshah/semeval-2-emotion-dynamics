@@ -6,6 +6,8 @@ scikit-learn
 matplotlib
 sentence-transformers
 torch
+transformers
+tqdm
 pyarrow
 jupyter
 ipykernel

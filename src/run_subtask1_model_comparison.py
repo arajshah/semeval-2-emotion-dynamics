@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,16 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import KFold
 
 from src.data_loader import load_all_data
+from src.eval.analysis_tools import (
+    evaluate_subtask1,
+    iter_slices,
+    make_seen_user_time_split,
+    make_unseen_user_splits,
+)
+from src.models.subtask1_transformer import get_repo_root
+from src.predict_subtask1_transformer import predict_subtask1_df
+
+PHASE0_EVAL_ONLY = False
 
 
 def _compute_fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
@@ -152,6 +162,124 @@ def _run_cv_tfidf_ridge(df: pd.DataFrame, n_splits: int = 5) -> Dict[str, float]
         fold_metrics.append(metrics)
 
     return _aggregate_metrics(fold_metrics)
+
+
+def _fit_tfidf_ridge(
+    train_text: np.ndarray, train_targets: np.ndarray
+) -> Tuple[TfidfVectorizer, Ridge]:
+    vectorizer = TfidfVectorizer(
+        max_features=20000,
+        ngram_range=(1, 2),
+        min_df=2,
+    )
+    X_train = vectorizer.fit_transform(train_text)
+    model = Ridge(alpha=1.0)
+    model.fit(X_train, train_targets)
+    return vectorizer, model
+
+
+def _predict_tfidf_ridge(
+    vectorizer: TfidfVectorizer, model: Ridge, texts: np.ndarray
+) -> np.ndarray:
+    X_val = vectorizer.transform(texts)
+    return model.predict(X_val)
+
+
+def _aggregate_unseen_user_metrics(
+    fold_rows: List[Dict[str, float]]
+) -> Dict[str, float]:
+    if not fold_rows:
+        raise ValueError("No fold rows provided for aggregation.")
+
+    base = fold_rows[0]
+    agg: Dict[str, float] = {
+        "regime": base["regime"],
+        "slice": base["slice"],
+        "n": int(sum(row["n"] for row in fold_rows)),
+    }
+
+    metric_keys = [
+        key
+        for key in base.keys()
+        if key not in {"regime", "slice", "n", "model"}
+    ]
+    for key in metric_keys:
+        values = np.array([row[key] for row in fold_rows], dtype=float)
+        agg[key] = float(np.nanmean(values)) if not np.isnan(values).all() else np.nan
+
+    return agg
+
+
+def run_phase0_subtask1_eval(df: pd.DataFrame, model_name: str = "tfidf_ridge") -> pd.DataFrame:
+    """
+    Run Phase 0 evaluation for Subtask 1 using a lightweight model.
+
+    For unseen-user folds, n is the sum of validation rows across folds.
+    """
+    texts = df["text"].to_numpy()
+    y = df[["valence", "arousal"]].to_numpy(dtype=float)
+
+    unseen_splits = make_unseen_user_splits(df, n_splits=5, seed=42)
+    seen_train_idx, seen_val_idx = make_seen_user_time_split(df, val_frac=0.2)
+
+    rows: List[Dict[str, float]] = []
+
+    # Unseen-user evaluation: aggregate metrics across folds.
+    slice_fold_rows: Dict[str, List[Dict[str, float]]] = {}
+    for train_idx, val_idx in unseen_splits:
+        vectorizer, model = _fit_tfidf_ridge(texts[train_idx], y[train_idx])
+        y_pred = _predict_tfidf_ridge(vectorizer, model, texts[val_idx])
+
+        pred_valence = np.full(len(df), np.nan, dtype=float)
+        pred_arousal = np.full(len(df), np.nan, dtype=float)
+        pred_valence[val_idx] = y_pred[:, 0]
+        pred_arousal[val_idx] = y_pred[:, 1]
+
+        for slice_name, slice_idx in iter_slices(df):
+            eval_idx = np.intersect1d(val_idx, slice_idx)
+            metrics = evaluate_subtask1(
+                df, pred_valence, pred_arousal, "unseen_user", slice_name, eval_idx
+            )
+            metrics["model"] = model_name
+            slice_fold_rows.setdefault(slice_name, []).append(metrics)
+
+    for slice_name, fold_rows in slice_fold_rows.items():
+        agg_row = _aggregate_unseen_user_metrics(fold_rows)
+        agg_row["model"] = model_name
+        rows.append(agg_row)
+
+    # Seen-user evaluation: single time-aware split.
+    vectorizer, model = _fit_tfidf_ridge(texts[seen_train_idx], y[seen_train_idx])
+    y_pred = _predict_tfidf_ridge(vectorizer, model, texts[seen_val_idx])
+
+    pred_valence = np.full(len(df), np.nan, dtype=float)
+    pred_arousal = np.full(len(df), np.nan, dtype=float)
+    pred_valence[seen_val_idx] = y_pred[:, 0]
+    pred_arousal[seen_val_idx] = y_pred[:, 1]
+
+    for slice_name, slice_idx in iter_slices(df):
+        eval_idx = np.intersect1d(seen_val_idx, slice_idx)
+        metrics = evaluate_subtask1(
+            df, pred_valence, pred_arousal, "seen_user", slice_name, eval_idx
+        )
+        metrics["model"] = model_name
+        rows.append(metrics)
+
+    df_report = pd.DataFrame(rows)
+    cols_order = [
+        "model",
+        "regime",
+        "slice",
+        "n",
+        "valence_mae",
+        "valence_mse",
+        "valence_pearson",
+        "arousal_mae",
+        "arousal_mse",
+        "arousal_pearson",
+    ]
+    df_report = df_report[cols_order]
+    return df_report
 
 
 def _run_cv_tfidf_plus_features_ridge(df: pd.DataFrame, n_splits: int = 5) -> Dict[str, float]:
@@ -299,10 +427,86 @@ def run_subtask1_model_comparison(n_splits: int = 5) -> pd.DataFrame:
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run Subtask 1 model comparison.")
+    parser.add_argument("--include_transformer", action="store_true")
+    args = parser.parse_args()
+
+    df = _prepare_subtask1_dataframe()
+    phase0_report = run_phase0_subtask1_eval(df)
+
+    reports_dir = get_repo_root() / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    phase0_path = reports_dir / "subtask1_phase0_eval.csv"
+
+    if args.include_transformer:
+        ckpt_dir = get_repo_root() / "models" / "subtask1_transformer" / "best"
+        if ckpt_dir.exists():
+            pred_valence, pred_arousal = predict_subtask1_df(
+                df, checkpoint_dir=ckpt_dir, use_cache=False
+            )
+
+            unseen_splits = make_unseen_user_splits(df, n_splits=5, seed=42)
+            seen_train_idx, seen_val_idx = make_seen_user_time_split(df, val_frac=0.2)
+
+            rows: List[Dict[str, float]] = []
+            slice_fold_rows: Dict[str, List[Dict[str, float]]] = {}
+            for _, val_idx in unseen_splits:
+                for slice_name, slice_idx in iter_slices(df):
+                    eval_idx = np.intersect1d(val_idx, slice_idx)
+                    metrics = evaluate_subtask1(
+                        df,
+                        pred_valence,
+                        pred_arousal,
+                        "unseen_user",
+                        slice_name,
+                        eval_idx,
+                    )
+                    metrics["model"] = "transformer_finetune"
+                    slice_fold_rows.setdefault(slice_name, []).append(metrics)
+
+            for slice_name, fold_rows in slice_fold_rows.items():
+                agg_row = _aggregate_unseen_user_metrics(fold_rows)
+                agg_row["model"] = "transformer_finetune"
+                rows.append(agg_row)
+
+            for slice_name, slice_idx in iter_slices(df):
+                eval_idx = np.intersect1d(seen_val_idx, slice_idx)
+                metrics = evaluate_subtask1(
+                    df,
+                    pred_valence,
+                    pred_arousal,
+                    "seen_user",
+                    slice_name,
+                    eval_idx,
+                )
+                metrics["model"] = "transformer_finetune"
+                rows.append(metrics)
+
+            transformer_report = pd.DataFrame(rows)
+            phase0_report = pd.concat([phase0_report, transformer_report], ignore_index=True)
+        else:
+            print(
+                "Transformer checkpoint not found at models/subtask1_transformer/best. "
+                "Train on Colab: python -m src.train_subtask1_transformer ..."
+            )
+
+    phase0_report.to_csv(phase0_path, index=False)
+    print(f"Wrote {phase0_path}")
+
+    best_valence = phase0_report.loc[phase0_report["valence_mae"].idxmin()]
+    best_arousal = phase0_report.loc[phase0_report["arousal_mae"].idxmin()]
+    print("Best valence MAE row:")
+    print(best_valence.to_string())
+    print("Best arousal MAE row:")
+    print(best_arousal.to_string())
+
+    if PHASE0_EVAL_ONLY:
+        return
+
     df_results = run_subtask1_model_comparison(n_splits=5)
 
-    reports_dir = Path("reports")
-    reports_dir.mkdir(parents=True, exist_ok=True)
     out_path = reports_dir / "subtask1_model_comparison.csv"
 
     df_results.to_csv(out_path, index=False)

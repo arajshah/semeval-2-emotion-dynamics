@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 
 from src.sequence_models.subtask2a_sequence_dataset import load_subtask2a_with_embeddings
 from src.sequence_models.simple_sequence_model import SimpleSequenceRegressor
@@ -40,6 +41,136 @@ def compute_delta_metrics(
         "Delta_MSE_arousal": mse_ar,
         "DirAcc_valence": dir_val,
         "DirAcc_arousal": dir_ar,
+    }
+
+
+def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    """
+    Compute MAE, MSE, and Pearson correlation for regression targets.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    diff = y_pred - y_true
+    mae = float(np.mean(np.abs(diff)))
+    mse = float(np.mean(diff**2))
+
+    if y_true.size < 2 or np.std(y_true) == 0 or np.std(y_pred) == 0:
+        pearson = np.nan
+    else:
+        pearson = float(np.corrcoef(y_true, y_pred)[0, 1])
+
+    return {"mae": mae, "mse": mse, "pearson": pearson}
+
+
+def iter_slices(df: pd.DataFrame) -> List[Tuple[str, pd.Index]]:
+    """
+    Return evaluation slices over the provided DataFrame.
+    """
+    slices: List[Tuple[str, pd.Index]] = [("all", df.index)]
+    if "is_words" in df.columns:
+        slices.append(("words", df.index[df["is_words"] == True]))
+        slices.append(("essays", df.index[df["is_words"] == False]))
+    return slices
+
+
+def make_unseen_user_splits(
+    df: pd.DataFrame, n_splits: int = 5, seed: int = 42
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Create group-aware train/val splits for unseen-user evaluation.
+    """
+    groups = df["user_id"].to_numpy()
+    indices = np.arange(len(df))
+    n_users = len(np.unique(groups))
+
+    if n_splits >= 2 and n_users >= n_splits:
+        splitter = GroupKFold(n_splits=n_splits)
+        splits = list(splitter.split(indices, groups=groups))
+    else:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=seed)
+        splits = list(splitter.split(indices, groups=groups))
+
+    return [(train_idx, val_idx) for train_idx, val_idx in splits]
+
+
+def make_seen_user_time_split(
+    df: pd.DataFrame, val_frac: float = 0.2
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Create a time-aware split within each user for seen-user evaluation.
+    """
+    time_cols = ["timestamp", "time", "date", "datetime"]
+    step_cols = ["entry_index", "t", "step", "idx"]
+    time_series = None
+
+    for col in time_cols:
+        if col in df.columns:
+            time_series = pd.to_datetime(df[col], errors="coerce")
+            break
+
+    if time_series is None:
+        for col in step_cols:
+            if col in df.columns:
+                time_series = pd.to_numeric(df[col], errors="coerce")
+                break
+
+    if time_series is not None:
+        working = df.copy()
+        working["_sort_time"] = time_series
+    else:
+        working = df
+
+    train_indices: List[int] = []
+    val_indices: List[int] = []
+
+    for _, group in working.groupby("user_id", sort=False):
+        if "_sort_time" in working.columns:
+            group = group.sort_values("_sort_time", kind="stable")
+
+        idx = group.index.to_numpy()
+        n = len(idx)
+        if n <= 1:
+            train_indices.extend(idx)
+            continue
+
+        n_train = int(np.floor(n * (1 - val_frac)))
+        n_train = max(1, min(n - 1, n_train))
+
+        train_indices.extend(idx[:n_train])
+        val_indices.extend(idx[n_train:])
+
+    return np.array(train_indices), np.array(val_indices)
+
+
+def evaluate_subtask1(
+    df: pd.DataFrame,
+    pred_valence: np.ndarray,
+    pred_arousal: np.ndarray,
+    regime: str,
+    slice_name: str,
+    idx: np.ndarray,
+) -> Dict[str, float]:
+    """
+    Compute metrics for a given Subtask 1 subset.
+    """
+    subset = df.iloc[idx]
+    y_valence = subset["valence"].to_numpy(dtype=float)
+    y_arousal = subset["arousal"].to_numpy(dtype=float)
+
+    metrics_val = compute_regression_metrics(y_valence, pred_valence[idx])
+    metrics_aro = compute_regression_metrics(y_arousal, pred_arousal[idx])
+
+    return {
+        "regime": regime,
+        "slice": slice_name,
+        "n": int(len(idx)),
+        "valence_mae": metrics_val["mae"],
+        "valence_mse": metrics_val["mse"],
+        "valence_pearson": metrics_val["pearson"],
+        "arousal_mae": metrics_aro["mae"],
+        "arousal_mse": metrics_aro["mse"],
+        "arousal_pearson": metrics_aro["pearson"],
     }
 
 
