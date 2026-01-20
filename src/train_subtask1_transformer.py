@@ -342,7 +342,7 @@ def main() -> None:
         if metrics["score"] > best_score:
             best_score = metrics["score"]
             best_epoch = epoch
-            save_hf_checkpoint(model, tokenizer, repo_root / cfg.output_dir / "best")
+            save_hf_checkpoint(model, tokenizer, repo_root / cfg.output_dir / "best", run_cfg=cfg)
 
     metrics_path = repo_root / cfg.output_dir / "metrics.json"
     metrics_payload = {

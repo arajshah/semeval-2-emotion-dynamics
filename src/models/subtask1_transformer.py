@@ -92,7 +92,13 @@ class Subtask1Dataset(torch.utils.data.Dataset):
 class Subtask1RegressorConfig(PretrainedConfig):
     model_type = "subtask1_regressor"
 
-    def __init__(self, model_name: str, dropout: float = 0.1, head_type: str = "simple", **kwargs):
+    def __init__(
+        self,
+        model_name: str = "microsoft/deberta-v3-base",  
+        dropout: float = 0.1,
+        head_type: str = "simple",
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.model_name = model_name
         self.dropout = dropout
@@ -143,11 +149,24 @@ def clip_preds(preds_np: np.ndarray) -> np.ndarray:
     return clipped
 
 
-def save_hf_checkpoint(model: Subtask1Regressor, tokenizer, out_dir: str | Path) -> Path:
+def save_hf_checkpoint(
+    model: Subtask1Regressor, 
+    tokenizer, 
+    out_dir: str | Path, 
+    run_cfg: Subtask1TransformerConfig | None = None,) -> Path:
+
     out_dir = Path(out_dir)
+    if out_dir.exists():
+        import shutil
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
     model.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
+
+    if run_cfg is not None:
+        with (out_dir / "run_config.json").open("w", encoding="utf-8") as f:
+            json.dump(run_cfg.to_json(), f, indent=2, sort_keys=True)
     return out_dir
 
 
