@@ -13,13 +13,15 @@ from sklearn.model_selection import KFold
 
 from src.data_loader import load_all_data
 from src.eval.analysis_tools import (
+    compute_subtask1_metrics_from_preds,
     evaluate_subtask1,
     iter_slices,
+    load_frozen_split,
     make_seen_user_time_split,
     make_unseen_user_splits,
 )
 from src.models.subtask1_transformer import get_repo_root
-from src.predict_subtask1_transformer import predict_subtask1_df
+from src.predict_subtask1_transformer import predict_subtask1_df, predict_subtask1_val_split
 
 PHASE0_EVAL_ONLY = False
 
@@ -431,6 +433,10 @@ def main():
 
     parser = argparse.ArgumentParser(description="Run Subtask 1 model comparison.")
     parser.add_argument("--include_transformer", action="store_true")
+    parser.add_argument(
+        "--split_path",
+        default="reports/splits/subtask1_unseen_user_seed42.json",
+    )
     args = parser.parse_args()
 
     df = _prepare_subtask1_dataframe()
@@ -441,55 +447,41 @@ def main():
     phase0_path = reports_dir / "subtask1_phase0_eval.csv"
 
     if args.include_transformer:
+        split_path = Path(args.split_path)
+        if not split_path.is_absolute():
+            split_path = get_repo_root() / split_path
+        if not split_path.exists():
+            raise FileNotFoundError(f"Frozen split JSON not found at {split_path}")
+
         ckpt_dir = get_repo_root() / "models" / "subtask1_transformer" / "best"
         if ckpt_dir.exists():
-            pred_valence, pred_arousal = predict_subtask1_df(
-                df, checkpoint_dir=ckpt_dir, use_cache=False
+            preds_path = reports_dir / "subtask1_transformer_val_preds.parquet"
+            agg_path = reports_dir / "subtask1_transformer_val_user_agg.parquet"
+            predict_subtask1_val_split(
+                split_path=split_path,
+                ckpt_dir=ckpt_dir,
+                output_path=preds_path,
+                output_user_agg_path=agg_path,
+                batch_size=16,
+                max_length=256,
+                seed=42,
             )
 
-            unseen_splits = make_unseen_user_splits(df, n_splits=5, seed=42)
-            seen_train_idx, seen_val_idx = make_seen_user_time_split(df, val_frac=0.2)
-
-            rows: List[Dict[str, float]] = []
-            slice_fold_rows: Dict[str, List[Dict[str, float]]] = {}
-            for _, val_idx in unseen_splits:
-                for slice_name, slice_idx in iter_slices(df):
-                    eval_idx = np.intersect1d(val_idx, slice_idx)
-                    metrics = evaluate_subtask1(
-                        df,
-                        pred_valence,
-                        pred_arousal,
-                        "unseen_user",
-                        slice_name,
-                        eval_idx,
-                    )
-                    metrics["model"] = "transformer_finetune"
-                    slice_fold_rows.setdefault(slice_name, []).append(metrics)
-
-            for slice_name, fold_rows in slice_fold_rows.items():
-                agg_row = _aggregate_unseen_user_metrics(fold_rows)
-                agg_row["model"] = "transformer_finetune"
-                rows.append(agg_row)
-
-            for slice_name, slice_idx in iter_slices(df):
-                eval_idx = np.intersect1d(seen_val_idx, slice_idx)
-                metrics = evaluate_subtask1(
-                    df,
-                    pred_valence,
-                    pred_arousal,
-                    "seen_user",
-                    slice_name,
-                    eval_idx,
+            _, val_idx = load_frozen_split(split_path, df)
+            preds_df = pd.read_parquet(preds_path)
+            metrics_rows = compute_subtask1_metrics_from_preds(df, preds_df, val_idx)
+            for row in metrics_rows:
+                row["model"] = "transformer_finetune"
+                row["regime"] = "unseen_user"
+                row["primary_score"] = float(
+                    np.mean([row["r_composite_valence"], row["r_composite_arousal"]])
                 )
-                metrics["model"] = "transformer_finetune"
-                rows.append(metrics)
-
-            transformer_report = pd.DataFrame(rows)
+            transformer_report = pd.DataFrame(metrics_rows)
             phase0_report = pd.concat([phase0_report, transformer_report], ignore_index=True)
         else:
             print(
                 "Transformer checkpoint not found at models/subtask1_transformer/best. "
-                "Train on Colab: python -m src.train_subtask1_transformer ..."
+                "Train first: python -m src.train_subtask1_transformer ..."
             )
 
     phase0_report.to_csv(phase0_path, index=False)
