@@ -437,6 +437,12 @@ def main():
         "--split_path",
         default="reports/splits/subtask1_unseen_user_seed42.json",
     )
+    parser.add_argument(
+        "--force_predict",
+        action="store_true",
+        help="If set, recompute transformer val predictions even if parquet outputs already exist.",
+    )
+
     args = parser.parse_args()
 
     df = _prepare_subtask1_dataframe()
@@ -457,15 +463,29 @@ def main():
         if ckpt_dir.exists():
             preds_path = reports_dir / "subtask1_transformer_val_preds.parquet"
             agg_path = reports_dir / "subtask1_transformer_val_user_agg.parquet"
-            predict_subtask1_val_split(
-                split_path=split_path,
-                ckpt_dir=ckpt_dir,
-                output_path=preds_path,
-                output_user_agg_path=agg_path,
-                batch_size=16,
-                max_length=256,
-                seed=42,
-            )
+            if (not args.force_predict) and preds_path.exists() and agg_path.exists():
+                print(
+                    f"Reusing existing transformer predictions:\n"
+                    f"  preds: {preds_path}\n"
+                    f"  agg:   {agg_path}\n"
+                    f"(Pass --force_predict to recompute.)"
+                )
+            else:
+                if preds_path.exists() or agg_path.exists():
+                    print(
+                        f"Recomputing transformer predictions (existing files will be overwritten):\n"
+                        f"  preds: {preds_path}\n"
+                        f"  agg:   {agg_path}"
+                    )
+                predict_subtask1_val_split(
+                    split_path=split_path,
+                    ckpt_dir=ckpt_dir,
+                    output_path=preds_path,
+                    output_user_agg_path=agg_path,
+                    batch_size=16,
+                    max_length=256,
+                    seed=42,
+                )
 
             _, val_idx = load_frozen_split(split_path, df)
             preds_df = pd.read_parquet(preds_path)
