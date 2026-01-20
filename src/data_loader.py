@@ -156,7 +156,7 @@ def load_all_data(data_dir: str = "data/raw") -> DataBundle:
         'subtask2b_detailed' -> train_subtask2b_detailed DataFrame
         'subtask2b_user' -> train_subtask2b_user_disposition_change DataFrame
     """
-    base_dir = Path(data_dir)
+    base_dir = _resolve_data_dir(data_dir)
     data_bundle: DataBundle = {}
 
     for name, filename in EXPECTED_FILES.items():
@@ -171,6 +171,28 @@ def load_all_data(data_dir: str = "data/raw") -> DataBundle:
         data_bundle[name] = normalized
 
     return data_bundle
+
+
+def _find_repo_root(start: Path) -> Path:
+    """
+    Find the repository root by walking up from `start`.
+    """
+    for parent in [start] + list(start.parents):
+        if (parent / ".git").exists():
+            return parent
+    return start
+
+
+def _resolve_data_dir(data_dir: str) -> Path:
+    """
+    Resolve `data_dir` relative to the repo root if it is not absolute.
+    """
+    base_dir = Path(data_dir)
+    if base_dir.is_absolute():
+        return base_dir
+
+    repo_root = _find_repo_root(Path(__file__).resolve())
+    return repo_root / base_dir
 
 
 def print_data_summary(data: DataBundle) -> None:

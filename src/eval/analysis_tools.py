@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Tuple
+import warnings
+import json
 
 import numpy as np
 import pandas as pd
@@ -15,32 +17,52 @@ from src.sequence_models.simple_sequence_model import SimpleSequenceRegressor
 def compute_delta_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    y_true_arousal: np.ndarray | None = None,
+    y_pred_arousal: np.ndarray | None = None,
 ) -> Dict[str, float]:
     """
-    Compute Δ-MAE, Δ-MSE, and direction accuracy for valence and arousal.
+    Compute delta metrics.
 
-    y_true, y_pred: shape (N, 2) with columns [ΔV, ΔA]
+    Legacy mode: y_true/y_pred are shape (N, 2) with columns [ΔV, ΔA].
+    Phase 0 mode: pass y_true/y_pred for valence, and y_true_arousal/y_pred_arousal
+    for arousal to compute Pearson r and MAE.
     """
-    mae_val = np.mean(np.abs(y_true[:, 0] - y_pred[:, 0]))
-    mae_ar = np.mean(np.abs(y_true[:, 1] - y_pred[:, 1]))
-    mse_val = np.mean((y_true[:, 0] - y_pred[:, 0]) ** 2)
-    mse_ar = np.mean((y_true[:, 1] - y_pred[:, 1]) ** 2)
+    if y_true_arousal is None and y_pred_arousal is None:
+        mae_val = np.mean(np.abs(y_true[:, 0] - y_pred[:, 0]))
+        mae_ar = np.mean(np.abs(y_true[:, 1] - y_pred[:, 1]))
+        mse_val = np.mean((y_true[:, 0] - y_pred[:, 0]) ** 2)
+        mse_ar = np.mean((y_true[:, 1] - y_pred[:, 1]) ** 2)
 
-    def direction_acc(y_t: np.ndarray, y_p: np.ndarray) -> float:
-        sign_true = np.sign(y_t)
-        sign_pred = np.sign(y_p)
-        return float((sign_true == sign_pred).mean())
+        def direction_acc(y_t: np.ndarray, y_p: np.ndarray) -> float:
+            sign_true = np.sign(y_t)
+            sign_pred = np.sign(y_p)
+            return float((sign_true == sign_pred).mean())
 
-    dir_val = direction_acc(y_true[:, 0], y_pred[:, 0])
-    dir_ar = direction_acc(y_true[:, 1], y_pred[:, 1])
+        dir_val = direction_acc(y_true[:, 0], y_pred[:, 0])
+        dir_ar = direction_acc(y_true[:, 1], y_pred[:, 1])
+
+        return {
+            "Delta_MAE_valence": mae_val,
+            "Delta_MAE_arousal": mae_ar,
+            "Delta_MSE_valence": mse_val,
+            "Delta_MSE_arousal": mse_ar,
+            "DirAcc_valence": dir_val,
+            "DirAcc_arousal": dir_ar,
+        }
+
+    if y_true_arousal is None or y_pred_arousal is None:
+        raise ValueError("Both arousal arrays must be provided for Phase 0 delta metrics.")
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    y_true_arousal = np.asarray(y_true_arousal, dtype=float)
+    y_pred_arousal = np.asarray(y_pred_arousal, dtype=float)
 
     return {
-        "Delta_MAE_valence": mae_val,
-        "Delta_MAE_arousal": mae_ar,
-        "Delta_MSE_valence": mse_val,
-        "Delta_MSE_arousal": mse_ar,
-        "DirAcc_valence": dir_val,
-        "DirAcc_arousal": dir_ar,
+        "r_delta_valence": safe_pearsonr(y_true, y_pred, label="delta_valence"),
+        "r_delta_arousal": safe_pearsonr(y_true_arousal, y_pred_arousal, label="delta_arousal"),
+        "mae_delta_valence": float(np.mean(np.abs(y_true - y_pred))),
+        "mae_delta_arousal": float(np.mean(np.abs(y_true_arousal - y_pred_arousal))),
     }
 
 
@@ -63,15 +85,168 @@ def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[s
     return {"mae": mae, "mse": mse, "pearson": pearson}
 
 
-def iter_slices(df: pd.DataFrame) -> List[Tuple[str, pd.Index]]:
+def safe_pearsonr(x: np.ndarray, y: np.ndarray, label: str = "") -> float:
     """
-    Return evaluation slices over the provided DataFrame.
+    Compute Pearson r, returning 0.0 (with warning) for constant arrays.
     """
-    slices: List[Tuple[str, pd.Index]] = [("all", df.index)]
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if x.size < 2 or y.size < 2 or np.std(x) == 0 or np.std(y) == 0:
+        warnings.warn(f"Constant or tiny arrays for Pearson r ({label}); returning 0.0")
+        return 0.0
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def iter_slices(df: pd.DataFrame) -> List[Tuple[str, np.ndarray]]:
+    """
+    Return evaluation slices as positional indices (0..len(df)-1), aligned with y_true/y_pred.
+    This avoids mixing pandas index labels with numpy positional indexing.
+    """
+    n = len(df)
+    all_pos = np.arange(n, dtype=int)
+
+    slices: List[Tuple[str, np.ndarray]] = [("all", all_pos)]
+
     if "is_words" in df.columns:
-        slices.append(("words", df.index[df["is_words"] == True]))
-        slices.append(("essays", df.index[df["is_words"] == False]))
+        mask_words = df["is_words"].to_numpy(dtype=bool)
+        slices.append(("words", np.flatnonzero(mask_words).astype(int)))
+        slices.append(("essays", np.flatnonzero(~mask_words).astype(int)))
+
     return slices
+
+
+def compute_subtask1_correlations(
+    df: pd.DataFrame,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> Dict[str, float]:
+    """
+    Compute within/between/composite correlations for valence and arousal.
+    """
+    # Ensure df.index is positional (0..len-1) and aligned with y_true/y_pred
+    df = df.reset_index(drop=True)
+    
+    def within_user_corr(values_true: np.ndarray, values_pred: np.ndarray) -> float:
+        per_user = []
+        for _, group in df.groupby("user_id", sort=False):
+            idx = group.index.to_numpy()
+            if len(idx) < 2:
+                continue
+            per_user.append(safe_pearsonr(values_true[idx], values_pred[idx], label="within_user"))
+        if not per_user:
+            warnings.warn("No users with >=2 points for within-user correlation; returning 0.0")
+            return 0.0
+        return float(np.mean(per_user))
+
+    def between_user_corr(values_true: np.ndarray, values_pred: np.ndarray) -> float:
+        grouped = df.groupby("user_id", sort=False)
+        true_means = grouped.apply(lambda g: float(np.mean(values_true[g.index])))
+        pred_means = grouped.apply(lambda g: float(np.mean(values_pred[g.index])))
+        return safe_pearsonr(true_means.to_numpy(), pred_means.to_numpy(), label="between_user")
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    within_v = within_user_corr(y_true[:, 0], y_pred[:, 0])
+    between_v = between_user_corr(y_true[:, 0], y_pred[:, 0])
+    within_a = within_user_corr(y_true[:, 1], y_pred[:, 1])
+    between_a = between_user_corr(y_true[:, 1], y_pred[:, 1])
+
+    return {
+        "r_within_valence": within_v,
+        "r_between_valence": between_v,
+        "r_composite_valence": float(np.mean([within_v, between_v])),
+        "r_within_arousal": within_a,
+        "r_between_arousal": between_a,
+        "r_composite_arousal": float(np.mean([within_a, between_a])),
+    }
+
+
+def compute_subtask1_slice_metrics(
+    df: pd.DataFrame,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> List[Dict[str, float]]:
+    """
+    Compute Subtask 1 metrics across slices (all/words/essays).
+    """
+    results: List[Dict[str, float]] = []
+    for slice_name, pos in iter_slices(df):
+        if len(pos) == 0:
+            continue
+        slice_df = df.iloc[pos].reset_index(drop=True)
+        slice_true = y_true[pos]
+        slice_pred = y_pred[pos]
+        corr = compute_subtask1_correlations(slice_df, slice_true, slice_pred)
+        diagnostics_val = compute_regression_metrics(slice_true[:, 0], slice_pred[:, 0])
+        diagnostics_aro = compute_regression_metrics(slice_true[:, 1], slice_pred[:, 1])
+        results.append(
+            {
+                "slice": slice_name,
+                **corr,
+                "mae_valence": diagnostics_val["mae"],
+                "mse_valence": diagnostics_val["mse"],
+                "mae_arousal": diagnostics_aro["mae"],
+                "mse_arousal": diagnostics_aro["mse"],
+            }
+        )
+    return results
+
+
+def load_frozen_split(split_path: str | Path, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load a frozen split JSON without creating new splits.
+    Supports Phase 0 schema and legacy id-based schema.
+    """
+    split_path = Path(split_path)
+    if not split_path.exists():
+        raise FileNotFoundError(f"Frozen split not found: {split_path}")
+
+    payload = json.loads(split_path.read_text())
+    if "train_indices" in payload and "val_indices" in payload:
+        train_idx = np.asarray(payload["train_indices"], dtype=int)
+        val_idx = np.asarray(payload["val_indices"], dtype=int)
+        return train_idx, val_idx
+
+    train_ids = payload.get("train_ids")
+    val_ids = payload.get("val_ids")
+    id_type = payload.get("id_type", "row_index")
+    if train_ids is None or val_ids is None:
+        raise ValueError(f"Unrecognized split schema in {split_path}")
+
+    if id_type == "text_id" and "text_id" in df.columns:
+        train_idx = df.index[df["text_id"].isin(set(train_ids))].to_numpy()
+        val_idx = df.index[df["text_id"].isin(set(val_ids))].to_numpy()
+    else:
+        train_idx = np.asarray(train_ids, dtype=int)
+        val_idx = np.asarray(val_ids, dtype=int)
+    return train_idx, val_idx
+
+
+def compute_subtask1_metrics_from_preds(
+    df: pd.DataFrame,
+    preds_df: pd.DataFrame,
+    val_idx: np.ndarray,
+) -> List[Dict[str, float]]:
+    """
+    Compute Subtask 1 metrics for frozen val indices using per-row predictions.
+    """
+    if "idx" not in preds_df.columns:
+        raise ValueError("Predictions DataFrame must include an 'idx' column.")
+
+    preds_df = preds_df.copy()
+    preds_df = preds_df.sort_values("idx").reset_index(drop=True)
+
+    val_idx = np.asarray(val_idx, dtype=int)
+    expected_idx = np.sort(val_idx)
+    pred_idx = preds_df["idx"].to_numpy(dtype=int)
+    if not np.array_equal(pred_idx, expected_idx):
+        raise ValueError("Prediction indices do not match the expected validation indices.")
+
+    val_df = df.iloc[expected_idx].reset_index(drop=True)
+    y_true = val_df[["valence", "arousal"]].to_numpy(dtype=float)
+    y_pred = preds_df[["valence_pred", "arousal_pred"]].to_numpy(dtype=float)
+    return compute_subtask1_slice_metrics(val_df, y_true, y_pred)
 
 
 def make_unseen_user_splits(
