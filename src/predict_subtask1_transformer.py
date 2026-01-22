@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from pathlib import Path
 from typing import Iterable, Tuple, Optional
 
@@ -18,6 +20,8 @@ from src.models.subtask1_transformer import (
     load_hf_checkpoint,
     set_seed,
 )
+from src.utils.provenance import write_run_metadata
+from src.utils.run_id import resolve_run_id, validate_run_id
 
 
 def _resolve_path(path: str | Path) -> Path:
@@ -55,7 +59,7 @@ def _predict_df(
 
 def predict_subtask1_df(
     df: pd.DataFrame,
-    checkpoint_dir: str | Path = "models/subtask1_transformer/best",
+    checkpoint_dir: str | Path | None = None,
     batch_size: int = 16,
     max_length: int | None = None,
     seed: int = 42,
@@ -63,8 +67,30 @@ def predict_subtask1_df(
     use_cache: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     repo_root = get_repo_root()
-    checkpoint_dir = _resolve_path(checkpoint_dir)
     cache_path = _resolve_path(cache_path)
+
+    if checkpoint_dir is None:
+        metrics_path = repo_root / "models" / "subtask1_transformer" / "metrics.json"
+        if not metrics_path.exists():
+            raise FileNotFoundError(
+                f"metrics.json not found at {metrics_path}. "
+                "Provide checkpoint_dir explicitly or run training to create metrics.json."
+            )
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+
+        best_ckpt = payload.get("best_checkpoint_dir")
+        best_run_id = payload.get("best_run_id")
+
+        if best_ckpt:
+            checkpoint_dir = best_ckpt
+        elif best_run_id:
+            checkpoint_dir = f"models/subtask1_transformer/runs/{best_run_id}"
+        else:
+            raise ValueError(
+                f"metrics.json at {metrics_path} missing best_checkpoint_dir and best_run_id."
+            )
+
+    checkpoint_dir = _resolve_path(checkpoint_dir)
 
     if use_cache and cache_path.exists():
         cached = pd.read_parquet(cache_path)
@@ -182,15 +208,13 @@ def ensemble_predictions(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Predict Subtask 1 transformer outputs.")
     parser.add_argument("--split_path", required=True)
-    parser.add_argument("--ckpt_dir", default="models/subtask1_transformer/best")
-    parser.add_argument(
-        "--output_path",
-        default="reports/subtask1_transformer_val_preds.parquet",
-    )
-    parser.add_argument(
-        "--output_user_agg_path",
-        default="reports/subtask1_transformer_val_user_agg.parquet",
-    )
+    parser.add_argument("--checkpoint_dir", default=None)
+    parser.add_argument("--ckpt_dir", default=None)
+    parser.add_argument("--run_id", default=None)
+    parser.add_argument("--infer_run_id_from_metrics", action="store_true")
+    parser.add_argument("--pred_dir", default="reports/preds")
+    parser.add_argument("--task", default="subtask1")
+    parser.add_argument("--task_tag", default="subtask1_transformer")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
@@ -205,6 +229,27 @@ def main() -> None:
     split_path = _resolve_path(args.split_path)
     if not split_path.exists():
         raise FileNotFoundError(f"Frozen split JSON not found at {split_path}")
+
+    run_id = args.run_id
+    best_checkpoint_dir = None
+    if run_id is None and args.infer_run_id_from_metrics:
+        metrics_path = _resolve_path("models/subtask1_transformer/metrics.json")
+        if not metrics_path.exists():
+            print("metrics.json not found; cannot infer run_id.", file=sys.stderr)
+            raise SystemExit(1)
+        payload = json.loads(metrics_path.read_text())
+        run_id = payload.get("best_run_id")
+        best_checkpoint_dir = payload.get("best_checkpoint_dir")
+        if not run_id:
+            print("best_run_id missing in metrics.json.", file=sys.stderr)
+            raise SystemExit(1)
+
+    if run_id is None:
+        print("run_id is required (or use --infer_run_id_from_metrics).", file=sys.stderr)
+        raise SystemExit(1)
+
+    run_id = resolve_run_id(run_id, args.task_tag, seed=args.seed)
+    validate_run_id(run_id)
 
     if args.ensemble_pred_paths or args.ensemble_ckpt_dirs:
         pred_paths = []
@@ -234,11 +279,25 @@ def main() -> None:
         print(f"Wrote ensemble predictions to {ensemble_output}")
         return
 
-    preds_path = _resolve_path(args.output_path)
-    agg_path = _resolve_path(args.output_user_agg_path)
+    pred_dir = _resolve_path(args.pred_dir)
+    preds_path = pred_dir / f"subtask1_val_preds__{run_id}.parquet"
+    agg_path = pred_dir / f"subtask1_val_user_agg__{run_id}.parquet"
+
+    checkpoint_dir = args.checkpoint_dir or args.ckpt_dir
+    if checkpoint_dir is None:
+        if best_checkpoint_dir:
+            checkpoint_dir = best_checkpoint_dir
+        else:
+            checkpoint_dir = f"models/subtask1_transformer/runs/{run_id}"
+    checkpoint_dir = _resolve_path(checkpoint_dir)
+
+    print(f"RUN_ID: {run_id}")
+    print(f"CHECKPOINT_DIR: {checkpoint_dir}")
+    print(f"PRED_DIR: {pred_dir}")
+
     predict_subtask1_val_split(
         split_path=split_path,
-        ckpt_dir=_resolve_path(args.ckpt_dir),
+        ckpt_dir=checkpoint_dir,
         output_path=preds_path,
         output_user_agg_path=agg_path,
         batch_size=args.batch_size,
@@ -247,6 +306,31 @@ def main() -> None:
     )
     print(f"Wrote per-row predictions to {preds_path}")
     print(f"Wrote per-user aggregates to {agg_path}")
+
+    repo_root = get_repo_root()
+    artifacts = {
+        "subtask1_val_preds": str(preds_path.relative_to(repo_root)),
+        "subtask1_val_user_agg": str(agg_path.relative_to(repo_root)),
+        "checkpoint_dir": str(checkpoint_dir.relative_to(repo_root)),
+        "split_path": str(split_path.relative_to(repo_root)),
+    }
+    config = {
+        "batch_size": args.batch_size,
+        "max_length": args.max_length,
+        "seed": args.seed,
+        "checkpoint_dir": str(checkpoint_dir),
+    }
+    write_run_metadata(
+        repo_root=repo_root,
+        run_id=run_id,
+        task=args.task,
+        task_tag=args.task_tag,
+        seed=args.seed,
+        regime="unseen_user",
+        split_path=str(split_path.relative_to(repo_root)),
+        config=config,
+        artifacts=artifacts,
+    )
 
 
 if __name__ == "__main__":
