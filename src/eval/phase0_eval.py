@@ -14,7 +14,10 @@ import pandas as pd
 from src.data_loader import load_all_data
 from src.eval.analysis_tools import (
     compute_delta_metrics,
+    compute_subtask1_metrics_from_preds,
     compute_subtask1_slice_metrics,
+    load_frozen_split,
+    make_seen_user_time_split,
     safe_pearsonr,
 )
 from src.eval.splits import get_repo_root, load_or_create_unseen_user_split
@@ -44,9 +47,15 @@ def _get_git_commit(repo_root: Path) -> str:
 def _compute_config_hash(args: argparse.Namespace) -> str:
     config_path = _resolve_repo_path(args.config_path)
     payload: Dict[str, Any] = {
+        "task": args.task,
+        "regime": args.regime,
         "seed": args.seed,
         "val_fraction": args.val_fraction,
         "model_tag": args.model_tag,
+        "run_id": args.run_id,
+        "pred_path": args.pred_path,
+        "pred_dir": args.pred_dir,
+        "split_path": args.split_path,
         "config_path": str(config_path) if config_path else None,
         "write_per_user_diagnostics": args.write_per_user_diagnostics,
     }
@@ -63,23 +72,42 @@ def _append_eval_records(rows: List[Dict[str, Any]], path: Path) -> None:
         return
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing_columns: List[str] = []
-    if path.exists():
-        with path.open("r", encoding="utf-8") as handle:
-            header = handle.readline().strip()
-            if header:
-                existing_columns = header.split(",")
+    
+    CANONICAL_COLUMNS = [
+        "run_id",
+        "git_commit",
+        "seed",
+        "timestamp",
+        "config_hash",
+        "task",
+        "regime",
+        "slice",
+        "model_tag",
+        "primary_score",
+        "r_composite_valence",
+        "r_within_valence",
+        "r_between_valence",
+        "r_composite_arousal",
+        "r_within_arousal",
+        "r_between_arousal",
+        "r_delta_valence",
+        "r_delta_arousal",
+        "mae_valence",
+        "mae_arousal",
+        "mse_valence",
+        "mse_arousal",
+        "mae_delta_valence",
+        "mae_delta_arousal",
+    ]
 
-    row_columns = list({key for row in rows for key in row.keys()})
-    if existing_columns:
-        for col in row_columns:
-            if col not in existing_columns:
-                existing_columns.append(col)
-        columns = existing_columns
-    else:
-        columns = row_columns
+    columns = CANONICAL_COLUMNS
 
-    df = pd.DataFrame(rows, columns=columns)
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        normalized = {col: row.get(col, "") for col in columns}
+        normalized_rows.append(normalized)
+
+    df = pd.DataFrame(normalized_rows, columns=columns)
     df.to_csv(path, mode="a", header=not path.exists(), index=False)
 
 
@@ -137,10 +165,15 @@ def _per_user_delta(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Phase 0 evaluation entrypoint.")
+    parser.add_argument("--task", choices=["subtask1", "subtask2a", "subtask2b"], default="subtask1")
+    parser.add_argument("--regime", choices=["unseen_user", "seen_user"], default="unseen_user")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val_fraction", type=float, default=0.2)
     parser.add_argument("--run_id", type=str, default=None)
-    parser.add_argument("--model_tag", type=str, default="baseline_or_external")
+    parser.add_argument("--model_tag", type=str, required=True)
+    parser.add_argument("--pred_path", type=str, default=None)
+    parser.add_argument("--pred_dir", type=str, default="reports/preds")
+    parser.add_argument("--split_path", type=str, default=None)
     parser.add_argument("--config_path", type=str, default=None)
     parser.add_argument(
         "--write_per_user_diagnostics",
@@ -151,7 +184,7 @@ def main() -> None:
 
     repo_root = get_repo_root()
     timestamp = datetime.now(timezone.utc).isoformat()
-    run_id = args.run_id or f"phase0_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{args.seed}"
+    run_id = args.run_id or ""
     git_commit = _get_git_commit(repo_root)
     config_hash = _compute_config_hash(args)
 
@@ -167,117 +200,168 @@ def main() -> None:
         "model_tag": args.model_tag,
     }
 
-    # Subtask 1: train-mean predictor
-    df1 = data["subtask1"]
-    train_idx, val_idx, _ = load_or_create_unseen_user_split(
-        df1, "subtask1", seed=args.seed, val_fraction=args.val_fraction
-    )
-    train_df = df1.iloc[train_idx]
-    val_df = df1.iloc[val_idx].reset_index(drop=True)
+    model_tag_is_transformer = "transformer" in args.model_tag.lower()
+    if model_tag_is_transformer and args.task != "subtask1":
+        raise SystemExit("Transformer eval routing is implemented only for subtask1.")
 
-    mean_valence = float(train_df["valence"].mean())
-    mean_arousal = float(train_df["arousal"].mean())
-    y_true = val_df[["valence", "arousal"]].to_numpy(dtype=float)
-    y_pred = np.column_stack(
-        [
-            np.full(len(val_df), mean_valence, dtype=float),
-            np.full(len(val_df), mean_arousal, dtype=float),
-        ]
-    )
+    pred_path: Path | None = _resolve_repo_path(args.pred_path)
+    split_path = _resolve_repo_path(args.split_path)
+    if split_path is None and args.regime == "unseen_user":
+        split_path = repo_root / "reports" / "splits" / f"{args.task}_unseen_user_seed{args.seed}.json"
 
-    for metrics in compute_subtask1_slice_metrics(val_df, y_true, y_pred):
-        primary_score = float(
-            np.mean([metrics["r_composite_valence"], metrics["r_composite_arousal"]])
+    if model_tag_is_transformer:
+        if (pred_path is None) == (args.run_id is None):
+            raise SystemExit(
+                "Transformer eval requires --run_id (and optional --pred_dir) or --pred_path."
+            )
+        if pred_path is None:
+            pred_path = repo_root / args.pred_dir / f"subtask1_val_preds__{args.run_id}.parquet"
+        if pred_path is None or not pred_path.exists():
+            raise SystemExit(f"Predictions file not found: {pred_path}")
+
+    if args.task == "subtask1":
+        df1 = data["subtask1"]
+        if args.regime == "unseen_user":
+            if split_path is not None and split_path.exists():
+                train_idx, val_idx = load_frozen_split(split_path, df1)
+            else:
+                train_idx, val_idx, _ = load_or_create_unseen_user_split(
+                    df1, "subtask1", seed=args.seed, val_fraction=args.val_fraction
+                )
+        else:
+            train_idx, val_idx = make_seen_user_time_split(df1, val_frac=0.2)
+
+        if model_tag_is_transformer:
+            if split_path is None or not split_path.exists():
+                raise SystemExit(f"Split file not found: {split_path}")
+            preds_df = pd.read_parquet(pred_path)
+            metrics_rows = compute_subtask1_metrics_from_preds(df1, preds_df, np.asarray(val_idx))
+            for metrics in metrics_rows:
+                primary_score = float(
+                    np.mean([metrics["r_composite_valence"], metrics["r_composite_arousal"]])
+                )
+                eval_rows.append(
+                    {
+                        **identity,
+                        "task": "subtask1",
+                        "regime": args.regime,
+                        "slice": metrics.pop("slice"),
+                        "primary_score": primary_score,
+                        **metrics,
+                    }
+                )
+        else:
+            train_df = df1.iloc[train_idx]
+            val_df = df1.iloc[val_idx].reset_index(drop=True)
+            mean_valence = float(train_df["valence"].mean())
+            mean_arousal = float(train_df["arousal"].mean())
+            y_true = val_df[["valence", "arousal"]].to_numpy(dtype=float)
+            y_pred = np.column_stack(
+                [
+                    np.full(len(val_df), mean_valence, dtype=float),
+                    np.full(len(val_df), mean_arousal, dtype=float),
+                ]
+            )
+            for metrics in compute_subtask1_slice_metrics(val_df, y_true, y_pred):
+                primary_score = float(
+                    np.mean([metrics["r_composite_valence"], metrics["r_composite_arousal"]])
+                )
+                eval_rows.append(
+                    {
+                        **identity,
+                        "task": "subtask1",
+                        "regime": args.regime,
+                        "slice": metrics.pop("slice"),
+                        "primary_score": primary_score,
+                        **metrics,
+                    }
+                )
+
+            if args.write_per_user_diagnostics:
+                per_user_df = _per_user_subtask1(val_df, y_true, y_pred)
+                out_path = repo_root / "reports" / f"per_user_subtask1_{run_id}.csv"
+                per_user_df.to_csv(out_path, index=False)
+
+    if args.task == "subtask2a":
+        df2a = data["subtask2a"]
+        if args.regime == "unseen_user":
+            train_idx, val_idx, _ = load_or_create_unseen_user_split(
+                df2a, "subtask2a", seed=args.seed, val_fraction=args.val_fraction
+            )
+        else:
+            train_idx, val_idx = make_seen_user_time_split(df2a, val_frac=0.2)
+        val_df = df2a.iloc[val_idx].copy()
+        mask = val_df["state_change_valence"].notna() & val_df["state_change_arousal"].notna()
+        val_df = val_df.loc[mask].reset_index(drop=True)
+
+        y_true_delta_v = val_df["state_change_valence"].to_numpy(dtype=float)
+        y_true_delta_a = val_df["state_change_arousal"].to_numpy(dtype=float)
+        y_pred_delta_v = np.zeros_like(y_true_delta_v, dtype=float)
+        y_pred_delta_a = np.zeros_like(y_true_delta_a, dtype=float)
+
+        metrics = compute_delta_metrics(
+            y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
         )
+        primary_score = float(np.mean([metrics["r_delta_valence"], metrics["r_delta_arousal"]]))
         eval_rows.append(
             {
                 **identity,
-                "task": "subtask1",
-                "regime": "unseen_user",
-                "slice": metrics.pop("slice"),
+                "task": "subtask2a",
+                "regime": args.regime,
+                "slice": "all",
                 "primary_score": primary_score,
                 **metrics,
             }
         )
 
-    if args.write_per_user_diagnostics:
-        per_user_df = _per_user_subtask1(val_df, y_true, y_pred)
-        out_path = repo_root / "reports" / f"per_user_subtask1_{run_id}.csv"
-        per_user_df.to_csv(out_path, index=False)
+        if args.write_per_user_diagnostics:
+            per_user_df = _per_user_delta(
+                val_df, y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
+            )
+            out_path = repo_root / "reports" / f"per_user_subtask2a_{run_id}.csv"
+            per_user_df.to_csv(out_path, index=False)
 
-    # Subtask 2A: delta=0 predictor
-    df2a = data["subtask2a"]
-    train_idx, val_idx, _ = load_or_create_unseen_user_split(
-        df2a, "subtask2a", seed=args.seed, val_fraction=args.val_fraction
-    )
-    val_df = df2a.iloc[val_idx].copy()
-    mask = val_df["state_change_valence"].notna() & val_df["state_change_arousal"].notna()
-    val_df = val_df.loc[mask].reset_index(drop=True)
-
-    y_true_delta_v = val_df["state_change_valence"].to_numpy(dtype=float)
-    y_true_delta_a = val_df["state_change_arousal"].to_numpy(dtype=float)
-    y_pred_delta_v = np.zeros_like(y_true_delta_v, dtype=float)
-    y_pred_delta_a = np.zeros_like(y_true_delta_a, dtype=float)
-
-    metrics = compute_delta_metrics(
-        y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
-    )
-    primary_score = float(np.mean([metrics["r_delta_valence"], metrics["r_delta_arousal"]]))
-    eval_rows.append(
-        {
-            **identity,
-            "task": "subtask2a",
-            "regime": "unseen_user",
-            "slice": "all",
-            "primary_score": primary_score,
-            **metrics,
-        }
-    )
-
-    if args.write_per_user_diagnostics:
-        per_user_df = _per_user_delta(
-            val_df, y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
+    if args.task == "subtask2b":
+        df2b = data["subtask2b_user"]
+        train_idx, val_idx, _ = load_or_create_unseen_user_split(
+            df2b,
+            "subtask2b",
+            seed=args.seed,
+            val_fraction=args.val_fraction,
+            split_key="user_disposition_change",
         )
-        out_path = repo_root / "reports" / f"per_user_subtask2a_{run_id}.csv"
-        per_user_df.to_csv(out_path, index=False)
+        val_df = df2b.iloc[val_idx].copy()
+        mask = val_df["disposition_change_valence"].notna() & val_df[
+            "disposition_change_arousal"
+        ].notna()
+        val_df = val_df.loc[mask].reset_index(drop=True)
 
-    # Subtask 2B: delta=0 predictor (user-level)
-    df2b = data["subtask2b_user"]
-    train_idx, val_idx, _ = load_or_create_unseen_user_split(
-        df2b, "subtask2b", seed=args.seed, val_fraction=args.val_fraction
-    )
-    val_df = df2b.iloc[val_idx].copy()
-    mask = val_df["disposition_change_valence"].notna() & val_df[
-        "disposition_change_arousal"
-    ].notna()
-    val_df = val_df.loc[mask].reset_index(drop=True)
+        y_true_delta_v = val_df["disposition_change_valence"].to_numpy(dtype=float)
+        y_true_delta_a = val_df["disposition_change_arousal"].to_numpy(dtype=float)
+        y_pred_delta_v = np.zeros_like(y_true_delta_v, dtype=float)
+        y_pred_delta_a = np.zeros_like(y_true_delta_a, dtype=float)
 
-    y_true_delta_v = val_df["disposition_change_valence"].to_numpy(dtype=float)
-    y_true_delta_a = val_df["disposition_change_arousal"].to_numpy(dtype=float)
-    y_pred_delta_v = np.zeros_like(y_true_delta_v, dtype=float)
-    y_pred_delta_a = np.zeros_like(y_true_delta_a, dtype=float)
-
-    metrics = compute_delta_metrics(
-        y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
-    )
-    primary_score = float(np.mean([metrics["r_delta_valence"], metrics["r_delta_arousal"]]))
-    eval_rows.append(
-        {
-            **identity,
-            "task": "subtask2b",
-            "regime": "unseen_user",
-            "slice": "all",
-            "primary_score": primary_score,
-            **metrics,
-        }
-    )
-
-    if args.write_per_user_diagnostics:
-        per_user_df = _per_user_delta(
-            val_df, y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
+        metrics = compute_delta_metrics(
+            y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
         )
-        out_path = repo_root / "reports" / f"per_user_subtask2b_{run_id}.csv"
-        per_user_df.to_csv(out_path, index=False)
+        primary_score = float(np.mean([metrics["r_delta_valence"], metrics["r_delta_arousal"]]))
+        eval_rows.append(
+            {
+                **identity,
+                "task": "subtask2b",
+                "regime": args.regime,
+                "slice": "all",
+                "primary_score": primary_score,
+                **metrics,
+            }
+        )
+
+        if args.write_per_user_diagnostics:
+            per_user_df = _per_user_delta(
+                val_df, y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
+            )
+            out_path = repo_root / "reports" / f"per_user_subtask2b_{run_id}.csv"
+            per_user_df.to_csv(out_path, index=False)
 
     eval_records_path = repo_root / "reports" / "eval_records.csv"
     _append_eval_records(eval_rows, eval_records_path)
