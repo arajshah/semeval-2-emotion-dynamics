@@ -1,34 +1,64 @@
 from __future__ import annotations
 
-import hashlib
-import json
-import subprocess
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict
+import argparse
+import re
+from datetime import datetime
+from typing import Optional
 
 
-def generate_run_id(prefix: str, seed: int) -> str:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    return f"{prefix}_{timestamp}_{seed}"
+_TASK_TAG_SAFE = re.compile(r"[^a-zA-Z0-9_]+")
+_RUN_ID_ALLOWED = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
 
-def compute_config_hash(config: Dict[str, Any], config_path: Path | None = None) -> str:
-    payload: Dict[str, Any] = dict(config)
-    if config_path is not None and config_path.exists():
-        payload["config_path"] = str(config_path)
-        payload["config_file_sha256"] = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+def _sanitize_task_tag(task_tag: str) -> str:
+    return _TASK_TAG_SAFE.sub("_", task_tag).strip("_")
 
 
-def get_git_commit(repo_root: Path) -> str:
-    try:
-        output = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            stderr=subprocess.DEVNULL,
-        )
-        return output.decode("utf-8").strip()
-    except Exception:
-        return "unknown"
+def generate_run_id(
+    task_tag: str,
+    seed: int | None = None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    safe_tag = _sanitize_task_tag(task_tag)
+    timestamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    run_id = f"{safe_tag}_{timestamp}"
+    if seed is not None:
+        run_id = f"{run_id}_seed{seed}"
+    return run_id
+
+
+def validate_run_id(run_id: str) -> None:
+    if not run_id:
+        raise ValueError("run_id must be non-empty.")
+    if "/" in run_id or "\\" in run_id:
+        raise ValueError("run_id must not contain path separators.")
+    if any(ch.isspace() for ch in run_id):
+        raise ValueError("run_id must not contain whitespace.")
+    if not _RUN_ID_ALLOWED.fullmatch(run_id):
+        raise ValueError("run_id contains invalid characters.")
+
+
+def resolve_run_id(
+    provided_run_id: Optional[str],
+    task_tag: str,
+    seed: int | None = None,
+) -> str:
+    if provided_run_id is not None:
+        validate_run_id(provided_run_id)
+        return provided_run_id
+    return generate_run_id(task_tag, seed=seed)
+
+
+def _main() -> None:
+    parser = argparse.ArgumentParser(description="Generate a run_id.")
+    parser.add_argument("--task_tag", required=True)
+    parser.add_argument("--seed", type=int, default=None)
+    args = parser.parse_args()
+
+    run_id = generate_run_id(args.task_tag, seed=args.seed)
+    print(run_id)
+
+
+if __name__ == "__main__":
+    _main()
