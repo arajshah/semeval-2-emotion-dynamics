@@ -31,7 +31,10 @@ from src.models.subtask1_transformer import (
     load_hf_checkpoint,
     save_hf_checkpoint,
 )
-from src.utils.run_id import compute_config_hash, generate_run_id, get_git_commit
+from src.utils.git_utils import get_git_commit
+from src.utils.hash_utils import config_hash
+from src.utils.provenance import write_run_metadata
+from src.utils.run_id import resolve_run_id, validate_run_id
 
 from tqdm.auto import tqdm
 
@@ -147,20 +150,32 @@ def main() -> None:
     parser.add_argument("--split_path", required=True)
     parser.add_argument("--resume_from_checkpoint", default=None)
     parser.add_argument("--resume_from", default=None)
-    parser.add_argument("--quick", action="store_true")
     parser.add_argument("--cpu_smoke", action="store_true")
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--run_id", type=str, default=None)
+    parser.add_argument("--task", default="subtask1")
+    parser.add_argument("--task_tag", default="subtask1_transformer")
+    parser.add_argument("--pred_dir", default="reports/preds")
     args = parser.parse_args()
 
-    if args.cpu_smoke or args.quick:
-        args.max_length = 128
+    if args.cpu_smoke:
+        args.max_length = 64
         args.batch_size = 2
         args.epochs = 1
         args.num_workers = 0
         args.amp = "off"
         args.grad_checkpointing = False
+        subset_size = 64
+    elif args.quick:
+        args.max_length = 128
+        args.batch_size = 2
+        args.epochs = 1
+        args.num_workers = 0
+        args.grad_checkpointing = False
         subset_size = 200
     else:
         subset_size = None
+
 
     cfg = Subtask1TransformerConfig(
         model_name=args.model_name,
@@ -179,13 +194,24 @@ def main() -> None:
     )
 
     set_seed(cfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu") if args.cpu_smoke else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
     amp_mode = _resolve_amp_mode(cfg.amp, device)
+    run_id = resolve_run_id(args.run_id, args.task_tag, seed=cfg.seed)
+    validate_run_id(run_id)
+    print(f"RUN_ID: {run_id}")
 
     df = _load_subtask1_df()
 
     repo_root = get_repo_root()
     reports_dir = repo_root / "reports"
+    run_checkpoint_dir = repo_root / "models" / "subtask1_transformer" / "runs" / run_id
+    if run_checkpoint_dir.exists():
+        raise FileExistsError(
+            f"Run checkpoint directory already exists: {run_checkpoint_dir}. "
+            "Provide a new --run_id to avoid overwrite."
+        )
     split_path = Path(args.split_path)
     if not split_path.is_absolute():
         split_path = repo_root / split_path
@@ -212,8 +238,6 @@ def main() -> None:
     resume_from = args.resume_from_checkpoint or args.resume_from
     if resume_from:
         resume_path = Path(resume_from)
-        if resume_path.name == "best":
-            raise ValueError("Refusing to resume from 'best/' checkpoint.")
         model, tokenizer = load_hf_checkpoint(resume_path, model_name_fallback=cfg.model_name)
     else:
         tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
@@ -241,7 +265,6 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=amp_mode == "fp16")
     best_score = -np.inf
     best_epoch = -1
-    run_id = generate_run_id("subtask1_transformer", cfg.seed)
     config_payload = {
         "lr": cfg.lr,
         "epochs": cfg.epochs,
@@ -254,7 +277,7 @@ def main() -> None:
         "grad_checkpointing": cfg.grad_checkpointing,
         "head_type": cfg.head_type,
     }
-    config_hash = compute_config_hash(config_payload)
+    cfg_hash = config_hash(config_payload)
     git_commit = get_git_commit(repo_root)
 
     if resume_from:
@@ -334,15 +357,18 @@ def main() -> None:
             "weight_decay": cfg.weight_decay,
             "dropout": cfg.dropout,
             "head_type": cfg.head_type,
-            "config_hash": config_hash,
+            "config_hash": cfg_hash,
             "split_path": str(split_path),
         }
-        _append_trainlog(reports_dir / "subtask1_transformer_trainlog.csv", trainlog_row)
+        _append_trainlog(
+            repo_root / "reports" / "trainlogs" / "subtask1" / f"subtask1_trainlog__{run_id}.csv",
+            trainlog_row,
+        )
 
         if metrics["score"] > best_score:
             best_score = metrics["score"]
             best_epoch = epoch
-            save_hf_checkpoint(model, tokenizer, repo_root / cfg.output_dir / "best", run_cfg=cfg)
+            save_hf_checkpoint(model, tokenizer, run_checkpoint_dir, run_cfg=cfg)
 
     metrics_path = repo_root / cfg.output_dir / "metrics.json"
     metrics_payload = {
@@ -350,15 +376,41 @@ def main() -> None:
         "best_epoch": best_epoch,
         "best_score": best_score,
         "config": config_payload,
-        "config_hash": config_hash,
+        "config_hash": cfg_hash,
         "regime": args.regime,
         "seed": cfg.seed,
         "split_path": str(split_path),
         "git_commit": git_commit,
         "timestamp": datetime.utcnow().isoformat(),
+        "best_checkpoint_dir": str(Path("models/subtask1_transformer/runs") / run_id),
     }
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    metrics_path.write_text(json.dumps(metrics_payload, indent=2))
+    previous_best_score = float("-inf")
+    if metrics_path.exists():
+        try:
+            previous_best_score = float(json.loads(metrics_path.read_text()).get("best_score", float("-inf")))
+        except Exception:
+            previous_best_score = float("-inf")
+
+    if best_score > previous_best_score:
+        metrics_path.write_text(json.dumps(metrics_payload, indent=2))
+
+    split_path_rel = str(split_path.relative_to(repo_root))
+    artifacts = {
+        "checkpoint_dir": str(Path("models/subtask1_transformer/runs") / run_id),
+        "metrics_json": str(Path("models/subtask1_transformer/metrics.json")),
+    }
+    write_run_metadata(
+        repo_root=repo_root,
+        run_id=run_id,
+        task=args.task,
+        task_tag=args.task_tag,
+        seed=cfg.seed,
+        regime=args.regime,
+        split_path=split_path_rel,
+        config=config_payload,
+        artifacts=artifacts,
+    )
 
 
 if __name__ == "__main__":
