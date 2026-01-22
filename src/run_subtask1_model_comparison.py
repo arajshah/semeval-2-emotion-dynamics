@@ -21,9 +21,6 @@ from src.eval.analysis_tools import (
     make_unseen_user_splits,
 )
 from src.models.subtask1_transformer import get_repo_root
-from src.predict_subtask1_transformer import predict_subtask1_df, predict_subtask1_val_split
-
-PHASE0_EVAL_ONLY = False
 
 
 def _compute_fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
@@ -433,14 +430,12 @@ def main():
 
     parser = argparse.ArgumentParser(description="Run Subtask 1 model comparison.")
     parser.add_argument("--include_transformer", action="store_true")
+    parser.add_argument("--run_id", default=None)
+    parser.add_argument("--pred_path", default=None)
+    parser.add_argument("--pred_dir", default="reports/preds")
     parser.add_argument(
         "--split_path",
         default="reports/splits/subtask1_unseen_user_seed42.json",
-    )
-    parser.add_argument(
-        "--force_predict",
-        action="store_true",
-        help="If set, recompute transformer val predictions even if parquet outputs already exist.",
     )
 
     args = parser.parse_args()
@@ -459,50 +454,56 @@ def main():
         if not split_path.exists():
             raise FileNotFoundError(f"Frozen split JSON not found at {split_path}")
 
-        ckpt_dir = get_repo_root() / "models" / "subtask1_transformer" / "best"
-        if ckpt_dir.exists():
-            preds_path = reports_dir / "subtask1_transformer_val_preds.parquet"
-            agg_path = reports_dir / "subtask1_transformer_val_user_agg.parquet"
-            if (not args.force_predict) and preds_path.exists() and agg_path.exists():
-                print(
-                    f"Reusing existing transformer predictions:\n"
-                    f"  preds: {preds_path}\n"
-                    f"  agg:   {agg_path}\n"
-                    f"(Pass --force_predict to recompute.)"
-                )
-            else:
-                if preds_path.exists() or agg_path.exists():
-                    print(
-                        f"Recomputing transformer predictions (existing files will be overwritten):\n"
-                        f"  preds: {preds_path}\n"
-                        f"  agg:   {agg_path}"
-                    )
-                predict_subtask1_val_split(
-                    split_path=split_path,
-                    ckpt_dir=ckpt_dir,
-                    output_path=preds_path,
-                    output_user_agg_path=agg_path,
-                    batch_size=16,
-                    max_length=256,
-                    seed=42,
-                )
+        pred_path = None
+        if args.pred_path:
+            pred_path = Path(args.pred_path)
+        elif args.run_id:
+            pred_path = Path(args.pred_dir) / f"subtask1_val_preds__{args.run_id}.parquet"
 
-            _, val_idx = load_frozen_split(split_path, df)
-            preds_df = pd.read_parquet(preds_path)
-            metrics_rows = compute_subtask1_metrics_from_preds(df, preds_df, val_idx)
-            for row in metrics_rows:
-                row["model"] = "transformer_finetune"
-                row["regime"] = "unseen_user"
-                row["primary_score"] = float(
-                    np.mean([row["r_composite_valence"], row["r_composite_arousal"]])
-                )
-            transformer_report = pd.DataFrame(metrics_rows)
-            phase0_report = pd.concat([phase0_report, transformer_report], ignore_index=True)
-        else:
+        if pred_path is None:
             print(
-                "Transformer checkpoint not found at models/subtask1_transformer/best. "
-                "Train first: python -m src.train_subtask1_transformer ..."
+                "Transformer included but no --run_id/--pred_path provided; skipping transformer."
             )
+        else:
+            if not pred_path.is_absolute():
+                pred_path = get_repo_root() / pred_path
+            if not pred_path.exists():
+                print(f"Transformer preds not found at {pred_path}; skipping transformer.")
+            else:
+                _, val_idx = load_frozen_split(split_path, df)
+                preds_df = pd.read_parquet(pred_path)
+                metrics_rows = compute_subtask1_metrics_from_preds(df, preds_df, val_idx)
+                label = "subtask1_transformer"
+                if args.run_id:
+                    label = f"{label}[{args.run_id}]"
+                for row in metrics_rows:
+                    row["model"] = label
+                    row["regime"] = "unseen_user"
+                    row["primary_score"] = float(
+                        np.mean([row["r_composite_valence"], row["r_composite_arousal"]])
+                    )
+                transformer_report = pd.DataFrame(metrics_rows)
+                phase0_report = pd.concat([phase0_report, transformer_report], ignore_index=True)
+
+    df_results = run_subtask1_model_comparison(n_splits=5)
+
+    comparison_rows = []
+    for _, r in df_results.iterrows():
+        comparison_rows.append(
+            {
+                "model": r["model_name"],
+                "regime": "cv",
+                "slice": "all",
+                "n": np.nan,
+                "valence_mae": r.get("MAE_valence_mean", np.nan),
+                "valence_mse": r.get("MSE_valence_mean", np.nan),
+                "valence_pearson": np.nan,
+                "arousal_mae": r.get("MAE_arousal_mean", np.nan),
+                "arousal_mse": r.get("MSE_arousal_mean", np.nan),
+                "arousal_pearson": np.nan,
+            }
+        )
+    phase0_report = pd.concat([phase0_report, pd.DataFrame(comparison_rows)], ignore_index=True)
 
     phase0_report.to_csv(phase0_path, index=False)
     print(f"Wrote {phase0_path}")
@@ -513,17 +514,6 @@ def main():
     print(best_valence.to_string())
     print("Best arousal MAE row:")
     print(best_arousal.to_string())
-
-    if PHASE0_EVAL_ONLY:
-        return
-
-    df_results = run_subtask1_model_comparison(n_splits=5)
-
-    out_path = reports_dir / "subtask1_model_comparison.csv"
-
-    df_results.to_csv(out_path, index=False)
-    print(f"Saved Subtask 1 model comparison metrics to {out_path}")
-    print(df_results)
 
 
 if __name__ == "__main__":
