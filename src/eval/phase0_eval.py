@@ -183,7 +183,7 @@ def main() -> None:
     args = parser.parse_args()
 
     repo_root = get_repo_root()
-    timestamp = datetime.now(timezone.utc).isoformat()
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds"),
     run_id = args.run_id or ""
     git_commit = _get_git_commit(repo_root)
     config_hash = _compute_config_hash(args)

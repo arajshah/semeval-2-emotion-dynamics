@@ -37,7 +37,7 @@ from src.utils.provenance import write_run_metadata
 from src.utils.run_id import resolve_run_id, validate_run_id
 
 from tqdm.auto import tqdm
-
+from datetime import timezone
 
 def _resolve_amp_mode(amp: str, device: torch.device) -> str:
     if amp in {"fp16", "bf16"} and device.type != "cuda":
@@ -381,7 +381,7 @@ def main() -> None:
         "seed": cfg.seed,
         "split_path": str(split_path),
         "git_commit": git_commit,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "best_checkpoint_dir": str(Path("models/subtask1_transformer/runs") / run_id),
     }
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
