@@ -20,7 +20,7 @@ from src.eval.analysis_tools import (
     make_seen_user_time_split,
     safe_pearsonr,
 )
-from src.eval.splits import get_repo_root, load_unseen_user_split, create_unseen_user_split
+from src.eval.splits import get_repo_root
 
 
 def _resolve_repo_path(path_str: str | None) -> Path | None:
@@ -185,6 +185,8 @@ def main() -> None:
     repo_root = get_repo_root()
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     run_id = args.run_id or ""
+    if model_tag_is_transformer and not run_id and pred_path is None:
+        raise SystemExit("Transformer eval requires --run_id when --pred_path is not provided.")
     git_commit = _get_git_commit(repo_root)
     config_hash = _compute_config_hash(args)
 
@@ -211,9 +213,11 @@ def main() -> None:
 
     if model_tag_is_transformer:
         if (pred_path is None) == (args.run_id is None):
-            raise SystemExit(
-                "Transformer eval requires --run_id (and optional --pred_dir) or --pred_path."
-            )
+            # Exactly one way to identify the preds: either explicit --pred_path OR (run_id + pred_dir)
+            if (pred_path is not None) and (args.run_id is not None):
+                raise SystemExit("Provide either --pred_path OR --run_id (not both).")
+            if (pred_path is None) and (args.run_id is None):
+                raise SystemExit("Transformer eval requires either --pred_path or --run_id.")
         if pred_path is None:
             pred_path = repo_root / args.pred_dir / f"subtask1_val_preds__{args.run_id}.parquet"
         if pred_path is None or not pred_path.exists():
@@ -233,6 +237,21 @@ def main() -> None:
             if split_path is None or not split_path.exists():
                 raise SystemExit(f"Split file not found: {split_path}")
             preds_df = pd.read_parquet(pred_path)
+
+            required_cols = {"idx", "valence_pred", "arousal_pred"}
+            missing = required_cols - set(preds_df.columns)
+            if missing:
+                raise SystemExit(f"Preds missing required columns {sorted(missing)} in {pred_path}")
+
+            # Range sanity (fails fast if you forgot to invert scaled arousal)
+            aro = preds_df["arousal_pred"].to_numpy(dtype=float)
+            if np.nanmin(aro) < -0.25 or np.nanmax(aro) > 2.25:
+                raise SystemExit(
+                    f"arousal_pred out of expected [0,2] range in {pred_path} "
+                    f"(min={np.nanmin(aro):.3f}, max={np.nanmax(aro):.3f}). "
+                    "Did you forget --scale_arousal_to_valence_range on predict?"
+                )
+
             metrics_rows = compute_subtask1_metrics_from_preds(df1, preds_df, np.asarray(val_idx))
             for metrics in metrics_rows:
                 primary_score = float(

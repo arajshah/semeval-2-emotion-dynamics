@@ -77,6 +77,9 @@ def _evaluate(
     loader: DataLoader,
     device: torch.device,
     df_val: pd.DataFrame,
+    *,
+    lambda_arousal: float = 1.0,
+    scale_arousal_to_valence_range: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     preds: list[np.ndarray] = []
@@ -89,14 +92,29 @@ def _evaluate(
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
+            if scale_arousal_to_valence_range:
+                labels = labels.clone()
+                labels[:, 1] = 2.0 * labels[:, 1] - 2.0
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = loss_fn(outputs, labels)
+            loss_val = torch.nn.SmoothL1Loss(reduction="sum")(outputs[:, 0], labels[:, 0])
+            loss_aro = torch.nn.SmoothL1Loss(reduction="sum")(outputs[:, 1], labels[:, 1])
+            loss = loss_val + float(lambda_arousal) * loss_aro
             total_loss += float(loss.item())
             total_count += int(labels.shape[0])
             preds.append(outputs.cpu().numpy())
+            labels_for_metrics = labels
+            if scale_arousal_to_valence_range:
+                labels_for_metrics = labels.clone()
+                labels_for_metrics[:, 1] = (labels_for_metrics[:, 1] + 2.0) / 2.0  # invert back to [0,2]
             targets.append(labels.cpu().numpy())
 
-    y_pred = clip_preds(np.concatenate(preds, axis=0))
+    y_pred = np.concatenate(preds, axis=0)
+
+    if scale_arousal_to_valence_range:
+        y_pred = y_pred.copy()
+        y_pred[:, 1] = (y_pred[:, 1] + 2.0) / 2.0
+
+    y_pred = clip_preds(y_pred)
     y_true = np.concatenate(targets, axis=0)
 
     corr = compute_subtask1_correlations(df_val, y_true, y_pred)
@@ -156,6 +174,17 @@ def main() -> None:
     parser.add_argument("--task", default="subtask1")
     parser.add_argument("--task_tag", default="subtask1_transformer")
     parser.add_argument("--pred_dir", default="reports/preds")
+    parser.add_argument(
+        "--lambda_arousal",
+        type=float,
+        default=1.0,
+        help="Weight for arousal loss: loss = loss_valence + lambda_arousal * loss_arousal",
+    )
+    parser.add_argument(
+        "--scale_arousal_to_valence_range",
+        action="store_true",
+        help="If set, scale arousal target from [0,2] -> [-2,2] during training (aro_scaled = 2*aro - 2).",
+    )
     args = parser.parse_args()
 
     if args.cpu_smoke:
@@ -276,6 +305,8 @@ def main() -> None:
         "amp": amp_mode,
         "grad_checkpointing": cfg.grad_checkpointing,
         "head_type": cfg.head_type,
+        "lambda_arousal": float(args.lambda_arousal),
+        "scale_arousal_to_valence_range": bool(args.scale_arousal_to_valence_range),
     }
     cfg_hash = config_hash(config_payload)
     git_commit = get_git_commit(repo_root)
@@ -306,19 +337,29 @@ def main() -> None:
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
+            if args.scale_arousal_to_valence_range:
+                labels = labels.clone()
+                labels[:, 1] = 2.0 * labels[:, 1] - 2.0
+
             if amp_mode == "fp16":
                 with torch.cuda.amp.autocast():
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = torch.nn.SmoothL1Loss()(outputs, labels)
+                    loss_val = torch.nn.SmoothL1Loss()(outputs[:, 0], labels[:, 0])
+                    loss_aro = torch.nn.SmoothL1Loss()(outputs[:, 1], labels[:, 1])
+                    loss = loss_val + float(args.lambda_arousal) * loss_aro
                 scaler.scale(loss).backward()
             elif amp_mode == "bf16":
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = torch.nn.SmoothL1Loss()(outputs, labels)
+                    loss_val = torch.nn.SmoothL1Loss()(outputs[:, 0], labels[:, 0])
+                    loss_aro = torch.nn.SmoothL1Loss()(outputs[:, 1], labels[:, 1])
+                    loss = loss_val + float(args.lambda_arousal) * loss_aro
                 loss.backward()
             else:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                loss = torch.nn.SmoothL1Loss()(outputs, labels)
+                loss_val = torch.nn.SmoothL1Loss()(outputs[:, 0], labels[:, 0])
+                loss_aro = torch.nn.SmoothL1Loss()(outputs[:, 1], labels[:, 1])
+                loss = loss_val + float(args.lambda_arousal) * loss_aro
                 loss.backward()
 
             if step % cfg.grad_accum_steps == 0:
@@ -335,7 +376,7 @@ def main() -> None:
             pbar.set_postfix(loss=float(loss.detach().cpu()))
 
         val_df = df.iloc[val_idx].copy().reset_index(drop=True)
-        metrics = _evaluate(model, val_loader, device, val_df)
+        metrics = _evaluate(model, val_loader, device, val_df, lambda_arousal=float(args.lambda_arousal), scale_arousal_to_valence_range=bool(args.scale_arousal_to_valence_range))
         train_loss = epoch_loss / max(1, epoch_count)
         trainlog_row = {
             "run_id": run_id,
@@ -359,6 +400,8 @@ def main() -> None:
             "head_type": cfg.head_type,
             "config_hash": cfg_hash,
             "split_path": str(split_path),
+            "lambda_arousal": float(args.lambda_arousal),
+            "scale_arousal_to_valence_range": bool(args.scale_arousal_to_valence_range),
         }
         _append_trainlog(
             repo_root / "reports" / "trainlogs" / "subtask1" / f"subtask1_trainlog__{run_id}.csv",

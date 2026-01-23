@@ -37,6 +37,8 @@ def _predict_df(
     batch_size: int,
     max_length: int,
     seed: int,
+    *,
+    do_clip: bool = True,
 ) -> np.ndarray:
     set_seed(seed)
     model, tokenizer = load_hf_checkpoint(checkpoint_dir)
@@ -54,7 +56,9 @@ def _predict_df(
             attention_mask = batch["attention_mask"].to(device)
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             preds.append(outputs.cpu().numpy())
-    return clip_preds(np.concatenate(preds, axis=0))
+    
+    out = np.concatenate(preds, axis=0)
+    return clip_preds(out) if do_clip else out
 
 
 def predict_subtask1_df(
@@ -102,7 +106,7 @@ def predict_subtask1_df(
             return cached["pred_valence"].to_numpy(), cached["pred_arousal"].to_numpy()
 
     effective_max_length = 256 if max_length is None else int(max_length)
-    y_pred = _predict_df(df, checkpoint_dir, batch_size, effective_max_length, seed)
+    y_pred = _predict_df(df, checkpoint_dir, batch_size, effective_max_length, seed, do_clip=not scale_arousal_to_valence_range)
     pred_valence = y_pred[:, 0]
     pred_arousal = y_pred[:, 1]
 
@@ -129,6 +133,8 @@ def predict_subtask1_val_split(
     batch_size: int,
     max_length: int,
     seed: int,
+    *,
+    scale_arousal_to_valence_range: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     data = load_all_data()
     df = data["subtask1"].copy().reset_index(drop=True)
@@ -136,7 +142,11 @@ def predict_subtask1_val_split(
     val_idx = np.sort(np.asarray(val_idx, dtype=int))
     val_df = df.iloc[val_idx].copy().reset_index(drop=True)
 
-    y_pred = _predict_df(val_df, ckpt_dir, batch_size, max_length, seed)
+    y_pred = _predict_df(val_df, ckpt_dir, batch_size, max_length, seed, do_clip=not scale_arousal_to_valence_range)
+    if scale_arousal_to_valence_range:
+        y_pred = y_pred.copy()
+        y_pred[:, 1] = (y_pred[:, 1] + 2.0) / 2.0
+        y_pred = clip_preds(y_pred)
     preds_df = pd.DataFrame(
         {
             "idx": val_idx,
@@ -218,6 +228,11 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--scale_arousal_to_valence_range",
+        action="store_true",
+        help="If set, invert arousal scaling on model outputs: [-2,2] -> [0,2] via (aro+2)/2 before saving.",
+    )
     parser.add_argument("--ensemble_pred_paths", default=None)
     parser.add_argument("--ensemble_ckpt_dirs", default=None)
     parser.add_argument(
@@ -271,6 +286,7 @@ def main() -> None:
                     batch_size=args.batch_size,
                     max_length=args.max_length,
                     seed=args.seed,
+                    scale_arousal_to_valence_range=bool(args.scale_arousal_to_valence_range),
                 )
                 preds_list.append(preds_df.sort_values("idx").reset_index(drop=True))
 
@@ -303,6 +319,7 @@ def main() -> None:
         batch_size=args.batch_size,
         max_length=args.max_length,
         seed=args.seed,
+        scale_arousal_to_valence_range=bool(args.scale_arousal_to_valence_range),
     )
     print(f"Wrote per-row predictions to {preds_path}")
     print(f"Wrote per-user aggregates to {agg_path}")
@@ -319,6 +336,7 @@ def main() -> None:
         "max_length": args.max_length,
         "seed": args.seed,
         "checkpoint_dir": str(checkpoint_dir),
+        "scale_arousal_to_valence_range": bool(args.scale_arousal_to_valence_range),
     }
     write_run_metadata(
         repo_root=repo_root,
