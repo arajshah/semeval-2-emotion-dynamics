@@ -102,34 +102,51 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
-def load_or_create_unseen_user_split(
+def load_unseen_user_split(
     df: pd.DataFrame,
     task_name: str,
     seed: int,
-    val_fraction: float = 0.2,
+    *,
     split_key: str | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, Path]:
-    """
-    Load or create a group-aware unseen-user split.
-    """
     if task_name not in {"subtask1", "subtask2a", "subtask2b"}:
         raise ValueError(f"Unsupported task for unseen-user split: {task_name}")
 
     split_path = get_split_path(task_name, "unseen_user", seed, split_key=split_key)
-    if split_path.exists():
-        payload = _read_json(split_path)
-        validate_split_payload(
-            payload,
-            task=task_name,
-            regime="unseen_user",
-            seed=seed,
-            n_total=len(df),
-            split_key=split_key,
-        )
-        train_idx = np.asarray(payload["train_indices"], dtype=int)
-        val_idx = np.asarray(payload["val_indices"], dtype=int)
-        validate_unseen_user_disjoint(df, train_idx.tolist(), val_idx.tolist())
-        return train_idx, val_idx, split_path
+    if not split_path.exists():
+        raise FileNotFoundError(f"Split file not found: {split_path}")
+
+    payload = _read_json(split_path)
+    validate_split_payload(
+        payload,
+        task=task_name,
+        regime="unseen_user",
+        seed=seed,
+        n_total=len(df),
+        split_key=split_key,
+    )
+    train_idx = np.asarray(payload["train_indices"], dtype=int)
+    val_idx = np.asarray(payload["val_indices"], dtype=int)
+    validate_unseen_user_disjoint(df, train_idx.tolist(), val_idx.tolist())
+    return train_idx, val_idx, split_path
+
+
+def create_unseen_user_split(
+    df: pd.DataFrame,
+    task_name: str,
+    seed: int,
+    *,
+    val_fraction: float = 0.2,
+    split_key: str | None = None,
+    overwrite: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Path]:
+    if task_name not in {"subtask1", "subtask2a", "subtask2b"}:
+        raise ValueError(f"Unsupported task for unseen-user split: {task_name}")
+
+    split_path = get_split_path(task_name, "unseen_user", seed, split_key=split_key)
+    if split_path.exists() and not overwrite:
+        # If already exists, just load+validate and return.
+        return load_unseen_user_split(df, task_name, seed, split_key=split_key)
 
     groups = df["user_id"].to_numpy()
     indices = np.arange(len(df))
@@ -144,14 +161,46 @@ def load_or_create_unseen_user_split(
         "n_total": int(len(indices)),
         "n_train": int(len(train_idx)),
         "n_val": int(len(val_idx)),
+        "val_fraction": float(val_fraction),
         "train_indices": train_idx.tolist(),
         "val_indices": val_idx.tolist(),
     }
     if split_key is not None:
         payload["split_key"] = split_key
+
+    validate_split_payload(
+        payload,
+        task=task_name,
+        regime="unseen_user",
+        seed=seed,
+        n_total=len(df),
+        split_key=split_key,
+    )
+    validate_unseen_user_disjoint(df, train_idx.tolist(), val_idx.tolist())
     _write_json(split_path, payload)
 
     return train_idx, val_idx, split_path
+
+
+def load_or_create_unseen_user_split(
+    df: pd.DataFrame,
+    task_name: str,
+    seed: int,
+    val_fraction: float = 0.2,
+    split_key: str | None = None,
+    *,
+    create_if_missing: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, Path]:
+    if create_if_missing:
+        return create_unseen_user_split(
+            df,
+            task_name,
+            seed,
+            val_fraction=val_fraction,
+            split_key=split_key,
+            overwrite=False,
+        )
+    return load_unseen_user_split(df, task_name, seed, split_key=split_key)
 
 
 def _cli() -> None:
@@ -163,6 +212,14 @@ def _cli() -> None:
         default="base",
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help="Comma-separated seeds (overrides --seed). Example: 43,44",
+    )
+    parser.add_argument("--val_fraction", type=float, default=0.2)
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     from src.data_loader import load_all_data
@@ -182,10 +239,20 @@ def _cli() -> None:
     else:
         df = data[args.task]
 
-    _, _, split_path = load_or_create_unseen_user_split(
-        df, args.task, seed=args.seed, split_key=split_key
-    )
-    print(f"Split path: {split_path}")
+    seeds = [args.seed]
+    if args.seeds:
+        seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+
+    for seed in seeds:
+        _, _, split_path = create_unseen_user_split(
+            df,
+            args.task,
+            seed=seed,
+            val_fraction=args.val_fraction,
+            split_key=split_key,
+            overwrite=bool(args.overwrite),
+        )
+        print(f"Split path: {split_path}")
 
 
 if __name__ == "__main__":
