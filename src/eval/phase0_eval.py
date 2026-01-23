@@ -185,6 +185,7 @@ def main() -> None:
     repo_root = get_repo_root()
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     run_id = args.run_id or ""
+    model_tag_is_transformer = "transformer" in args.model_tag.lower()
     if model_tag_is_transformer and not run_id and pred_path is None:
         raise SystemExit("Transformer eval requires --run_id when --pred_path is not provided.")
     git_commit = _get_git_commit(repo_root)
@@ -202,7 +203,6 @@ def main() -> None:
         "model_tag": args.model_tag,
     }
 
-    model_tag_is_transformer = "transformer" in args.model_tag.lower()
     if model_tag_is_transformer and args.task != "subtask1":
         raise SystemExit("Transformer eval routing is implemented only for subtask1.")
 
