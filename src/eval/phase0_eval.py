@@ -20,7 +20,7 @@ from src.eval.analysis_tools import (
     make_seen_user_time_split,
     safe_pearsonr,
 )
-from src.eval.splits import get_repo_root, load_or_create_unseen_user_split
+from src.eval.splits import get_repo_root, load_unseen_user_split, create_unseen_user_split
 
 
 def _resolve_repo_path(path_str: str | None) -> Path | None:
@@ -225,9 +225,7 @@ def main() -> None:
             if split_path is not None and split_path.exists():
                 train_idx, val_idx = load_frozen_split(split_path, df1)
             else:
-                train_idx, val_idx, _ = load_or_create_unseen_user_split(
-                    df1, "subtask1", seed=args.seed, val_fraction=args.val_fraction
-                )
+                raise SystemExit(f"Split file not found: {split_path}")
         else:
             train_idx, val_idx = make_seen_user_time_split(df1, val_frac=0.2)
 
@@ -285,9 +283,12 @@ def main() -> None:
     if args.task == "subtask2a":
         df2a = data["subtask2a"]
         if args.regime == "unseen_user":
-            train_idx, val_idx, _ = load_or_create_unseen_user_split(
-                df2a, "subtask2a", seed=args.seed, val_fraction=args.val_fraction
-            )
+            split_path_2a = split_path
+            if split_path_2a is None:
+                split_path_2a = repo_root / "reports" / "splits" / f"subtask2a_unseen_user_seed{args.seed}.json"
+            if not split_path_2a.exists():
+                raise SystemExit(f"Split file not found: {split_path_2a}")
+            train_idx, val_idx = load_frozen_split(split_path_2a, df2a)
         else:
             train_idx, val_idx = make_seen_user_time_split(df2a, val_frac=0.2)
         val_df = df2a.iloc[val_idx].copy()
@@ -323,13 +324,12 @@ def main() -> None:
 
     if args.task == "subtask2b":
         df2b = data["subtask2b_user"]
-        train_idx, val_idx, _ = load_or_create_unseen_user_split(
-            df2b,
-            "subtask2b",
-            seed=args.seed,
-            val_fraction=args.val_fraction,
-            split_key="user_disposition_change",
-        )
+
+        split_path_2b = repo_root / "reports" / "splits" / f"subtask2b_user_disposition_change_unseen_user_seed{args.seed}.json"
+        if not split_path_2b.exists():
+            raise SystemExit(f"Split file not found: {split_path_2b}")
+        train_idx, val_idx = load_frozen_split(split_path_2b, df2b)
+
         val_df = df2b.iloc[val_idx].copy()
         mask = val_df["disposition_change_valence"].notna() & val_df[
             "disposition_change_arousal"
