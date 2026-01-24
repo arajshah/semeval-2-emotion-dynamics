@@ -2,12 +2,19 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Tuple
+import argparse
+import random
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import torch
 from sentence_transformers import SentenceTransformer
+from transformers import AutoModel, AutoTokenizer
 
 from src.data_loader import load_all_data
+from src.utils.git_utils import get_git_commit
+from src.utils.provenance import sha256_file, merge_run_metadata
 
 
 def _get_processed_dir() -> Path:
@@ -17,6 +24,10 @@ def _get_processed_dir() -> Path:
     processed_dir = Path("data") / "processed"
     processed_dir.mkdir(parents=True, exist_ok=True)
     return processed_dir
+
+
+def _get_repo_root() -> Path:
+    return Path(".").resolve()
 
 
 def load_subtask1_for_embeddings() -> pd.DataFrame:
@@ -86,6 +97,66 @@ def compute_embeddings_for_subtask1(
     return embeddings, user_ids, text_ids
 
 
+def _set_determinism(seed: int | None) -> None:
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    torch.set_num_threads(1)
+    try:
+        torch.use_deterministic_algorithms(True)
+    except Exception:
+        pass
+
+
+def compute_embeddings_for_subtask2a_deberta(
+    df: pd.DataFrame,
+    model_name: str,
+    max_length: int,
+    batch_size: int,
+    device: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    required = {"user_id", "text_id", "text"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns for subtask2a embeddings: {sorted(missing)}")
+
+    texts = df["text"].fillna("").astype(str).tolist()
+    user_ids = df["user_id"].to_numpy()
+    text_ids = df["text_id"].to_numpy()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model.to(device)
+    model.eval()
+
+    embeddings: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, len(texts), batch_size):
+            batch_texts = texts[start : start + batch_size]
+            encoded = tokenizer(
+                batch_texts,
+                truncation=True,
+                padding="max_length",
+                max_length=max_length,
+                return_tensors="pt",
+            )
+            encoded = {k: v.to(device) for k, v in encoded.items()}
+            outputs = model(**encoded)
+            cls_emb = outputs.last_hidden_state[:, 0, :].detach().cpu().numpy()
+            embeddings.append(cls_emb.astype(np.float32))
+
+    emb = np.concatenate(embeddings, axis=0)
+    if emb.shape[0] != len(texts):
+        raise RuntimeError("Embedding count does not match number of texts.")
+    return emb, user_ids, text_ids
+
+
 def save_subtask1_embeddings(
     embeddings: np.ndarray,
     user_ids: np.ndarray,
@@ -113,21 +184,83 @@ def save_subtask1_embeddings(
 
 
 def main() -> None:
-    """
-    Entry point for extracting and saving Subtask 1 text embeddings.
-    """
-    df = load_subtask1_for_embeddings()
-    model_name = "sentence-transformers/all-MiniLM-L6-v2"
-    model = load_sentence_encoder(model_name=model_name)
+    parser = argparse.ArgumentParser(description="Extract embeddings.")
+    parser.add_argument("--task", choices=["subtask1", "subtask2a"], default="subtask1")
+    parser.add_argument("--model_name", default="sentence-transformers/all-MiniLM-L6-v2")
+    parser.add_argument("--max_length", type=int, default=256)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--run_id", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
 
-    embeddings, user_ids, text_ids = compute_embeddings_for_subtask1(df, model)
+    repo_root = _get_repo_root()
+    _set_determinism(args.seed)
 
-    save_subtask1_embeddings(
-        embeddings=embeddings,
-        user_ids=user_ids,
-        text_ids=text_ids,
-        model_name="all-MiniLM-L6-v2",
+    if args.task == "subtask1":
+        df = load_subtask1_for_embeddings()
+        model = load_sentence_encoder(model_name=args.model_name)
+        embeddings, user_ids, text_ids = compute_embeddings_for_subtask1(
+            df, model, batch_size=args.batch_size
+        )
+        save_subtask1_embeddings(
+            embeddings=embeddings,
+            user_ids=user_ids,
+            text_ids=text_ids,
+            model_name=args.model_name.split("/")[-1],
+        )
+        return
+
+    if not args.run_id:
+        raise SystemExit("--run_id is required for subtask2a embeddings.")
+    if args.model_name != "microsoft/deberta-v3-base" or args.max_length != 256:
+        raise SystemExit(
+            "Subtask2a embeddings require --model_name microsoft/deberta-v3-base and --max_length 256."
+        )
+
+    data = load_all_data(data_dir=str(repo_root / "data" / "raw"))
+    df_raw = data["subtask2a"].copy()
+    print(f"Loaded subtask2a rows: {len(df_raw)} from data_dir={repo_root / 'data' / 'raw'}")
+    embeddings, user_ids, text_ids = compute_embeddings_for_subtask2a_deberta(
+        df_raw,
+        model_name=args.model_name,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        device=args.device,
     )
+
+    processed_dir = _get_processed_dir()
+    out_path = processed_dir / f"subtask2a_embeddings__{args.run_id}.npz"
+    if out_path.exists():
+        raise FileExistsError(f"Embeddings file already exists: {out_path}")
+    np.savez_compressed(
+        out_path,
+        embeddings=embeddings,
+        user_id=user_ids,
+        text_id=text_ids,
+    )
+    npz_sha = sha256_file(out_path)
+
+    merge_run_metadata(
+        repo_root=repo_root,
+        run_id=args.run_id,
+        updates={
+            "task": "subtask2a",
+            "task_tag": "subtask2a_embeddings",
+            "model_name": args.model_name,
+            "max_length": args.max_length,
+            "pooling": "cls",
+            "batch_size": args.batch_size,
+            "device": args.device,
+            "seed": args.seed,
+            "df_raw_len": int(len(df_raw)),
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "git_commit": get_git_commit(repo_root),
+            "embeddings_path": str(out_path),
+            "embeddings_sha256": npz_sha,
+        },
+    )
+    print(f"Saved Subtask2A embeddings to: {out_path}")
 
 
 if __name__ == "__main__":
