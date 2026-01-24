@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.data_loader import load_all_data
-from src.eval.analysis_tools import load_frozen_split
+from src.eval.splits import load_frozen_split
 from src.models.subtask1_transformer import (
     Subtask1Dataset,
     clip_preds,

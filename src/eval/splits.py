@@ -130,6 +130,34 @@ def load_unseen_user_split(
     validate_unseen_user_disjoint(df, train_idx.tolist(), val_idx.tolist())
     return train_idx, val_idx, split_path
 
+def load_frozen_split(split_path: str | Path, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load a frozen split JSON without creating new splits.
+    Supports Phase 0 schema and legacy id-based schema.
+    """
+    split_path = Path(split_path)
+    if not split_path.exists():
+        raise FileNotFoundError(f"Frozen split not found: {split_path}")
+
+    payload = json.loads(split_path.read_text())
+    if "train_indices" in payload and "val_indices" in payload:
+        train_idx = np.asarray(payload["train_indices"], dtype=int)
+        val_idx = np.asarray(payload["val_indices"], dtype=int)
+        return train_idx, val_idx
+
+    train_ids = payload.get("train_ids")
+    val_ids = payload.get("val_ids")
+    id_type = payload.get("id_type", "row_index")
+    if train_ids is None or val_ids is None:
+        raise ValueError(f"Unrecognized split schema in {split_path}")
+
+    if id_type == "text_id" and "text_id" in df.columns:
+        train_idx = df.index[df["text_id"].isin(set(train_ids))].to_numpy()
+        val_idx = df.index[df["text_id"].isin(set(val_ids))].to_numpy()
+    else:
+        train_idx = np.asarray(train_ids, dtype=int)
+        val_idx = np.asarray(val_ids, dtype=int)
+    return train_idx, val_idx
 
 def create_unseen_user_split(
     df: pd.DataFrame,

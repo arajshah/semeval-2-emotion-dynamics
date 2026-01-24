@@ -192,37 +192,6 @@ def compute_subtask1_slice_metrics(
         )
     return results
 
-
-def load_frozen_split(split_path: str | Path, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Load a frozen split JSON without creating new splits.
-    Supports Phase 0 schema and legacy id-based schema.
-    """
-    split_path = Path(split_path)
-    if not split_path.exists():
-        raise FileNotFoundError(f"Frozen split not found: {split_path}")
-
-    payload = json.loads(split_path.read_text())
-    if "train_indices" in payload and "val_indices" in payload:
-        train_idx = np.asarray(payload["train_indices"], dtype=int)
-        val_idx = np.asarray(payload["val_indices"], dtype=int)
-        return train_idx, val_idx
-
-    train_ids = payload.get("train_ids")
-    val_ids = payload.get("val_ids")
-    id_type = payload.get("id_type", "row_index")
-    if train_ids is None or val_ids is None:
-        raise ValueError(f"Unrecognized split schema in {split_path}")
-
-    if id_type == "text_id" and "text_id" in df.columns:
-        train_idx = df.index[df["text_id"].isin(set(train_ids))].to_numpy()
-        val_idx = df.index[df["text_id"].isin(set(val_ids))].to_numpy()
-    else:
-        train_idx = np.asarray(train_ids, dtype=int)
-        val_idx = np.asarray(val_ids, dtype=int)
-    return train_idx, val_idx
-
-
 def compute_subtask1_metrics_from_preds(
     df: pd.DataFrame,
     preds_df: pd.DataFrame,
@@ -481,6 +450,161 @@ def compute_subtask2a_predictions(
     )
 
     return df, metrics
+
+
+def compute_subtask2a_val_user_preds_from_sequence_model(
+    *,
+    df_raw: pd.DataFrame,
+    val_idx: np.ndarray,
+    run_id: str,
+    seed: int,
+    model_path: Path | str,
+    embeddings_path: Path | str,
+    seq_len: int,
+    hidden_dim: int,
+    num_layers: int,
+    batch_size: int,
+) -> pd.DataFrame:
+    """
+    Build per-user anchored predictions for Subtask 2A validation split.
+    """
+    val_df_raw = df_raw.iloc[val_idx].copy()
+    val_df_raw["timestamp"] = pd.to_datetime(val_df_raw["timestamp"])
+    if len(val_df_raw) != len(val_idx):
+        raise RuntimeError(
+            f"val_df_raw length mismatch: {len(val_df_raw)} vs val_idx {len(val_idx)}"
+        )
+    anchor_idx = np.asarray(val_idx, dtype=int)
+    if anchor_idx.min() < 0 or anchor_idx.max() >= len(df_raw):
+        raise RuntimeError("anchor_idx out of bounds for df_raw.")
+    val_df_raw["anchor_idx"] = anchor_idx
+
+    eligible_mask = val_df_raw["state_change_valence"].notna() & val_df_raw[
+        "state_change_arousal"
+    ].notna()
+    eligible_df = val_df_raw.loc[eligible_mask].copy()
+
+    if eligible_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "run_id",
+                "seed",
+                "user_id",
+                "anchor_idx",
+                "anchor_text_id",
+                "anchor_timestamp",
+                "delta_valence_true",
+                "delta_arousal_true",
+                "delta_valence_pred",
+                "delta_arousal_pred",
+            ]
+        )
+
+    anchors = (
+        eligible_df.sort_values(["user_id", "timestamp"], kind="stable")
+        .groupby("user_id", sort=False)
+        .tail(1)
+        .sort_values("user_id", kind="stable")
+    )
+
+    merged, embeddings = load_subtask2a_with_embeddings(embeddings_path)
+    if not np.issubdtype(merged["timestamp"].dtype, np.datetime64):
+        merged["timestamp"] = pd.to_datetime(merged["timestamp"])
+
+    embedding_dim = embeddings.shape[1]
+    merged_by_user = {
+        user_id: group.sort_values("timestamp", kind="stable").reset_index(drop=True)
+        for user_id, group in merged.groupby("user_id", sort=False)
+    }
+
+    seqs: list[np.ndarray] = []
+    lengths: list[int] = []
+    rows: list[dict] = []
+
+    for _, anchor in anchors.iterrows():
+        user_id = anchor["user_id"]
+        text_id = anchor["text_id"]
+        anchor_ts = anchor["timestamp"]
+        anchor_idx = int(anchor["anchor_idx"])
+
+        group = merged_by_user.get(user_id)
+        if group is None:
+            raise RuntimeError(f"Missing user in embeddings merge: {user_id}")
+
+        history = group[group["timestamp"] <= anchor_ts].reset_index(drop=True)
+        if history.empty:
+            raise RuntimeError(f"No history found for user {user_id} at anchor timestamp.")
+
+        anchor_match = history[history["text_id"] == text_id]
+        if anchor_match.empty:
+            raise RuntimeError(
+                f"Anchor (user_id={user_id}, text_id={text_id}) missing in embeddings merge."
+            )
+
+        emb_indices = history["emb_index"].to_numpy()
+        actual_len = len(emb_indices)
+        start = max(0, actual_len - seq_len)
+        window_indices = emb_indices[start:actual_len]
+
+        seq = np.zeros((seq_len, embedding_dim), dtype=np.float32)
+        seq[seq_len - len(window_indices) :] = embeddings[window_indices]
+
+        seqs.append(seq)
+        lengths.append(len(window_indices))
+        rows.append(
+            {
+                "run_id": run_id,
+                "seed": seed,
+                "user_id": user_id,
+                "anchor_idx": anchor_idx,
+                "anchor_text_id": int(text_id),
+                "anchor_timestamp": anchor_ts,
+                "delta_valence_true": float(anchor["state_change_valence"]),
+                "delta_arousal_true": float(anchor["state_change_arousal"]),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    sequences = np.stack(seqs, axis=0)
+    lengths_arr = np.array(lengths, dtype=np.int64)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SimpleSequenceRegressor(
+        embedding_dim=embedding_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+    ).to(device)
+    model_path = Path(model_path)
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    preds_list: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, len(sequences), batch_size):
+            end = start + batch_size
+            batch_seq = torch.from_numpy(sequences[start:end]).to(device)
+            batch_lengths = torch.from_numpy(lengths_arr[start:end]).to(device)
+            outputs = model(batch_seq, batch_lengths)
+            preds_list.append(outputs.cpu().numpy())
+
+    preds = np.concatenate(preds_list, axis=0)
+    df_out = pd.DataFrame(rows)
+    df_out["delta_valence_pred"] = preds[:, 0]
+    df_out["delta_arousal_pred"] = preds[:, 1]
+
+    if df_out["user_id"].duplicated().any():
+        raise RuntimeError("Expected one row per user in anchored preds.")
+    if df_out["anchor_idx"].duplicated().any():
+        raise RuntimeError("Anchor indices are not unique.")
+    if df_out["anchor_idx"].min() < 0 or df_out["anchor_idx"].max() >= len(df_raw):
+        raise RuntimeError("Anchor indices out of bounds.")
+    if df_out[["delta_valence_pred", "delta_arousal_pred"]].isna().any().any():
+        raise RuntimeError("NaNs found in prediction columns.")
+
+    return df_out
 
 
 def save_subtask2a_predictions(

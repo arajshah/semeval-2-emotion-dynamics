@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from src.data_loader import load_all_data
-from src.verify.shared import CheckResult, VerifyContext, pass_result, fail_result
+from src.verify.shared import CheckResult, VerifyContext, pass_result, fail_result, warn_result, print_results, exit_code
 
 
 def _load_split_indices(payload: dict, split_path: Path) -> tuple[list, list]:
@@ -121,22 +121,39 @@ def run_checks(ctx: VerifyContext) -> List[CheckResult]:
         }
         if any(count > 0 for count in loaded_nan_counts.values()):
             results.append(
-                fail_result(
-                    "subtask2a_loaded_delta_no_nans",
-                    f"Loader produced NaNs in delta columns: {loaded_nan_counts}",
-                    hint=(
-                        "Loader must fill/drop NaNs for Subtask 2A delta columns; "
-                        "fix in data_loader preprocessing."
-                    ),
+                pass_result(
+                    "subtask2a_loaded_delta_nans_allowed",
+                    f"Loaded df contains NaNs in delta cols (expected): {loaded_nan_counts}",
                 )
             )
+            results[-1].hint = "df_raw may contain NaNs; eligibility = both deltas non-NaN."
         else:
             results.append(
-                pass_result(
-                    "subtask2a_loaded_delta_no_nans",
-                    "Loaded Subtask 2A delta columns have no NaNs",
+                warn_result(
+                    "subtask2a_loaded_delta_nans_allowed",
+                    "No NaNs in loaded df delta cols; ensure df_raw row set is unchanged.",
+                    hint="df_raw may contain NaNs; eligibility = both deltas non-NaN.",
                 )
             )
+
+    if len(df) != len(raw_df):
+        results.append(
+            fail_result(
+                "subtask2a_df_raw_rowcount_matches_csv",
+                f"df_raw rowcount mismatch: load_all_data returned {len(df)} rows but CSV has {len(raw_df)}.",
+                hint=(
+                    "Fix load_all_data() to return an unfiltered df for subtask2a; "
+                    "split indices require df_raw be unmodified."
+                ),
+            )
+        )
+        return results
+    results.append(
+        pass_result(
+            "subtask2a_df_raw_rowcount_matches_csv",
+            f"df_raw rowcount matches CSV ({len(df)} rows).",
+        )
+    )
 
     split_path = repo_root / "reports" / "splits" / f"subtask2a_unseen_user_seed{ctx.seed}.json"
     if not split_path.exists():
@@ -162,6 +179,16 @@ def run_checks(ctx: VerifyContext) -> List[CheckResult]:
                 "subtask2a_split_indices_valid",
                 f"Failed to parse split indices from {split_path}: {exc}",
                 hint="Ensure split JSON uses train_indices/val_indices schema.",
+            )
+        )
+        return results
+
+    if "n_total" in payload and int(payload["n_total"]) != len(df):
+        results.append(
+            fail_result(
+                "subtask2a_split_indices_valid",
+                f"Split n_total mismatch in {split_path}: {payload['n_total']} != {len(df)}",
+                hint="Regenerate split against the correct subtask2a dataframe.",
             )
         )
         return results
@@ -228,61 +255,402 @@ def run_checks(ctx: VerifyContext) -> List[CheckResult]:
             )
         )
 
-    preds_path = repo_root / "reports" / "subtask2a_predictions.parquet"
-    if preds_path.exists():
-        try:
-            preds = pd.read_parquet(preds_path)
-        except Exception as exc:
+    if ctx.mode == "strict":
+        results.extend(_phase2_artifact_checks(ctx, df))
+
+    if ctx.run_id is None:
+        results.append(
+            warn_result(
+                "subtask2a_anchored_preds_ok",
+                "SKIP: run_id not provided; cannot validate anchored preds under reports/preds/.",
+                hint="Run verify with --run_id <RUN_ID>.",
+            )
+        )
+        return results
+
+    preds_path = repo_root / "reports" / "preds" / f"subtask2a_val_user_preds__{ctx.run_id}.parquet"
+    if not preds_path.exists():
+        results.append(
+            warn_result(
+                "subtask2a_anchored_preds_ok",
+                f"SKIP: anchored preds not found at {preds_path}",
+                hint=f"Generate via phase0_eval with --task subtask2a --run_id {ctx.run_id}.",
+            )
+        )
+        return results
+
+    try:
+        preds = pd.read_parquet(preds_path)
+    except Exception as exc:
+        results.append(
+            fail_result(
+                "subtask2a_anchored_preds_ok",
+                f"Failed to read {preds_path}: {exc}",
+                hint="Regenerate anchored preds and ensure parquet is readable.",
+            )
+        )
+        return results
+
+    required_cols = {
+        "user_id",
+        "anchor_idx",
+        "anchor_text_id",
+        "anchor_timestamp",
+        "delta_valence_pred",
+        "delta_arousal_pred",
+        "delta_valence_true",
+        "delta_arousal_true",
+    }
+    missing_cols = required_cols - set(preds.columns)
+    if missing_cols:
+        results.append(
+            fail_result(
+                "subtask2a_anchored_preds_ok",
+                f"Missing required columns in {preds_path}: {sorted(missing_cols)}",
+                hint="Regenerate anchored preds with the canonical schema.",
+            )
+        )
+        return results
+
+    if preds["user_id"].duplicated().any():
+        results.append(
+            fail_result(
+                "subtask2a_anchored_preds_ok",
+                f"Expected one row per user in {preds_path}",
+                hint="Ensure anchoring selects exactly one row per user.",
+            )
+        )
+        return results
+
+    val_df_raw = df.iloc[val_idx].copy()
+    val_df_raw["anchor_idx"] = np.asarray(val_idx, dtype=int)
+    val_df_raw["timestamp"] = pd.to_datetime(val_df_raw["timestamp"])
+    eligible_mask = val_df_raw["state_change_valence"].notna() & val_df_raw[
+        "state_change_arousal"
+    ].notna()
+    eligible_df = val_df_raw.loc[eligible_mask].copy()
+    expected_anchors = (
+        eligible_df.sort_values(["user_id", "timestamp"], kind="stable")
+        .groupby("user_id", sort=False)
+        .tail(1)
+    )
+    expected_users = set(expected_anchors["user_id"].tolist())
+    pred_users = set(preds["user_id"].tolist())
+    if not pred_users.issubset(expected_users):
+        extra_users = sorted(pred_users - expected_users)
+        results.append(
+            fail_result(
+                "subtask2a_anchored_preds_ok",
+                f"Anchored preds include users without eligible anchors (extra={extra_users[:5]}).",
+                hint="Ensure anchored preds are a subset of eligible users.",
+            )
+        )
+        return results
+
+    anchor_idx = preds["anchor_idx"].astype(int).to_numpy()
+    if len(anchor_idx) != len(set(anchor_idx)):
+        results.append(
+            fail_result(
+                "subtask2a_anchored_preds_ok",
+                f"Duplicate anchor_idx values in {preds_path}",
+                hint="Ensure one unique anchor per user.",
+            )
+        )
+        return results
+
+    val_set = set(val_idx)
+    if not set(anchor_idx).issubset(val_set):
+        results.append(
+            fail_result(
+                "subtask2a_anchored_preds_ok",
+                f"anchor_idx includes rows outside val split in {preds_path}",
+                hint="Ensure anchor_idx comes from the frozen val indices.",
+            )
+        )
+        return results
+
+    if np.any(anchor_idx < 0) or np.any(anchor_idx >= len(df)):
+        results.append(
+            fail_result(
+                "subtask2a_anchored_preds_ok",
+                f"anchor_idx out of bounds in {preds_path}",
+                hint="Ensure anchor_idx refers to df_raw positional indices.",
+            )
+        )
+        return results
+
+    df_raw_ts = pd.to_datetime(df["timestamp"])
+    for _, row in preds.iterrows():
+        idx = int(row["anchor_idx"])
+        raw_row = df.iloc[idx]
+        if row["user_id"] != raw_row["user_id"]:
             results.append(
                 fail_result(
-                    "subtask2a_predictions_artifact_ok",
-                    f"Failed to read predictions artifact {preds_path}: {exc}",
-                    hint="Regenerate predictions with src.eval.analysis_tools utilities.",
+                    "subtask2a_anchored_preds_ok",
+                    f"user_id mismatch at anchor_idx={idx}",
+                    hint="Ensure anchor_idx points to the correct user row.",
+                )
+            )
+            return results
+        if int(row["anchor_text_id"]) != int(raw_row["text_id"]):
+            results.append(
+                fail_result(
+                    "subtask2a_anchored_preds_ok",
+                    f"anchor_text_id mismatch at anchor_idx={idx}",
+                    hint="Ensure anchor_text_id matches df_raw text_id.",
+                )
+            )
+            return results
+        if pd.to_datetime(row["anchor_timestamp"]) != df_raw_ts.iloc[idx]:
+            results.append(
+                fail_result(
+                    "subtask2a_anchored_preds_ok",
+                    f"anchor_timestamp mismatch at anchor_idx={idx}",
+                    hint="Ensure anchor_timestamp matches df_raw timestamp.",
                 )
             )
             return results
 
-        candidate_sets = [
-            ("delta_val_pred", "delta_aro_pred"),
-            ("valence_pred", "arousal_pred"),
-        ]
-        pred_cols = None
-        for col_a, col_b in candidate_sets:
-            if col_a in preds.columns and col_b in preds.columns:
-                pred_cols = (col_a, col_b)
-                break
-
-        if pred_cols is None:
+    expected_anchor_idx_by_user = expected_anchors.set_index("user_id")["anchor_idx"]
+    for _, row in preds.iterrows():
+        user_id = row["user_id"]
+        expected_idx = int(expected_anchor_idx_by_user.loc[user_id])
+        if int(row["anchor_idx"]) != expected_idx:
             results.append(
                 fail_result(
-                    "subtask2a_predictions_artifact_ok",
-                    f"Missing prediction columns in {preds_path}",
-                    hint="Expected delta_val_pred/delta_aro_pred or valence_pred/arousal_pred.",
+                    "subtask2a_anchored_preds_ok",
+                    f"Anchor not latest eligible for user {user_id}",
+                    hint="Ensure anchor selection uses latest eligible timestamp.",
                 )
             )
-        else:
-            vals = preds[list(pred_cols)].to_numpy(dtype=float)
-            if not np.isfinite(vals).all():
-                results.append(
-                    fail_result(
-                        "subtask2a_predictions_artifact_ok",
-                        f"Non-finite values in predictions {preds_path}",
-                        hint="Regenerate predictions and ensure outputs are finite.",
-                    )
+            return results
+
+        raw_row = df.iloc[int(row["anchor_idx"])]
+        if pd.isna(raw_row["state_change_valence"]) or pd.isna(raw_row["state_change_arousal"]):
+            results.append(
+                fail_result(
+                    "subtask2a_anchored_preds_ok",
+                    f"Anchor not eligible for user {user_id} at idx={int(row['anchor_idx'])}",
+                    hint="Ensure anchors are selected only from eligible rows.",
                 )
-            else:
-                results.append(
-                    pass_result(
-                        "subtask2a_predictions_artifact_ok",
-                        f"Predictions artifact OK: {preds_path}",
-                    )
-                )
-    else:
+            )
+            return results
+
+    vals = preds[["delta_valence_pred", "delta_arousal_pred"]].to_numpy(dtype=float)
+    if not np.isfinite(vals).all():
         results.append(
-            pass_result(
-                "subtask2a_predictions_artifact_ok",
-                f"SKIP: predictions artifact not found at {preds_path}",
+            fail_result(
+                "subtask2a_anchored_preds_ok",
+                f"Non-finite prediction values in {preds_path}",
+                hint="Regenerate anchored preds with finite outputs.",
             )
         )
+        return results
+
+    results.append(
+        pass_result(
+            "subtask2a_anchored_preds_ok",
+            f"Anchored preds schema and alignment OK: {preds_path}",
+        )
+    )
 
     return results
+
+
+def _phase2_artifact_checks(ctx: VerifyContext, df: pd.DataFrame) -> List[CheckResult]:
+    results: List[CheckResult] = []
+    repo_root = ctx.repo_root
+    run_id = ctx.run_id
+    if run_id is None:
+        results.append(
+            warn_result(
+                "subtask2a_phase2_artifacts_ok",
+                "SKIP: run_id not provided; cannot validate Phase 2 artifacts.",
+                hint="Run verify with --run_id <RUN_ID>.",
+            )
+        )
+        return results
+
+    embeddings_path = repo_root / "data" / "processed" / f"subtask2a_embeddings__{run_id}.npz"
+    if not embeddings_path.exists():
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Missing embeddings NPZ: {embeddings_path}",
+                hint="Build embeddings with extract_embeddings for subtask2a.",
+            )
+        )
+        return results
+
+    try:
+        npz = np.load(embeddings_path)
+        if not {"embeddings", "user_id", "text_id"}.issubset(set(npz.files)):
+            results.append(
+                fail_result(
+                    "subtask2a_phase2_artifacts_ok",
+                    f"Embeddings NPZ missing required arrays: {embeddings_path}",
+                    hint="Ensure embeddings NPZ includes embeddings/user_id/text_id.",
+                )
+            )
+            return results
+        if npz["embeddings"].shape[0] != len(npz["user_id"]) or npz["embeddings"].shape[0] != len(npz["text_id"]):
+            results.append(
+                fail_result(
+                    "subtask2a_phase2_artifacts_ok",
+                    f"Embeddings NPZ array length mismatch: {embeddings_path}",
+                    hint="Regenerate embeddings NPZ.",
+                )
+            )
+            return results
+    except Exception as exc:
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Failed to load embeddings NPZ {embeddings_path}: {exc}",
+                hint="Regenerate embeddings NPZ.",
+            )
+        )
+        return results
+
+    emb_index_df = pd.DataFrame(
+        {
+            "user_id": npz["user_id"],
+            "text_id": npz["text_id"],
+            "emb_index": np.arange(len(npz["user_id"])),
+        }
+    )
+    try:
+        merged = df.merge(
+            emb_index_df,
+            on=["user_id", "text_id"],
+            how="inner",
+            validate="one_to_one",
+        )
+    except Exception as exc:
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Embedding alignment failed: {exc}",
+                hint="Ensure embeddings align one-to-one on user_id/text_id.",
+            )
+        )
+        return results
+    if len(merged) == 0:
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                "Embedding alignment returned zero rows.",
+                hint="Ensure embeddings were built from the same subtask2a CSV.",
+            )
+        )
+        return results
+
+    model_path = repo_root / "models" / "subtask2a_sequence" / "runs" / run_id / "model.pt"
+    if not model_path.exists():
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Missing model checkpoint: {model_path}",
+                hint="Train Subtask2A sequence model with frozen split.",
+            )
+        )
+        return results
+
+    trainlog_path = repo_root / "reports" / "trainlogs" / "subtask2a" / f"subtask2a_trainlog__{run_id}.csv"
+    if not trainlog_path.exists():
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Missing trainlog: {trainlog_path}",
+                hint="Train Subtask2A sequence model to generate trainlog.",
+            )
+        )
+        return results
+    try:
+        if pd.read_csv(trainlog_path).empty:
+            results.append(
+                fail_result(
+                    "subtask2a_phase2_artifacts_ok",
+                    f"Trainlog is empty: {trainlog_path}",
+                    hint="Ensure training writes per-epoch logs.",
+                )
+            )
+            return results
+    except Exception as exc:
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Failed to read trainlog {trainlog_path}: {exc}",
+                hint="Ensure trainlog CSV is readable.",
+            )
+        )
+        return results
+
+    run_json = repo_root / "reports" / "runs" / f"{run_id}.json"
+    if not run_json.exists():
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Missing run metadata: {run_json}",
+                hint="Ensure training writes reports/runs/{run_id}.json.",
+            )
+        )
+        return results
+    try:
+        payload = json.loads(run_json.read_text())
+    except Exception as exc:
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Failed to read run metadata {run_json}: {exc}",
+                hint="Ensure run metadata JSON is valid.",
+            )
+        )
+        return results
+
+    required_keys = {"task", "seed", "split_path", "embeddings_path", "embeddings_sha256", "df_raw_len"}
+    missing_keys = sorted(required_keys - set(payload.keys()))
+    if missing_keys:
+        results.append(
+            fail_result(
+                "subtask2a_phase2_artifacts_ok",
+                f"Run metadata missing keys: {missing_keys}",
+                hint="Ensure training/provenance writes required fields.",
+            )
+        )
+        return results
+
+    results.append(
+        pass_result(
+            "subtask2a_phase2_artifacts_ok",
+            "Phase2 artifacts and metadata OK.",
+        )
+    )
+    return results
+
+
+def _cli() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Verify Subtask 2A anchored preds.")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--run_id", type=str, required=True)
+    args = parser.parse_args()
+
+    ctx = VerifyContext(
+        repo_root=Path(__file__).resolve().parents[2],
+        mode="strict",
+        tasks=["subtask2a"],
+        seed=args.seed,
+        run_id=args.run_id,
+    )
+    results = run_checks(ctx)
+    print_results(
+        f"Verify Subtask2a (seed={args.seed}, run_id={args.run_id})",
+        results,
+    )
+    raise SystemExit(exit_code(results))
+
+
+if __name__ == "__main__":
+    _cli()

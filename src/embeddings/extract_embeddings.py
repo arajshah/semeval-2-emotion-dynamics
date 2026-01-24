@@ -16,6 +16,8 @@ from src.data_loader import load_all_data
 from src.utils.git_utils import get_git_commit
 from src.utils.provenance import sha256_file, merge_run_metadata
 
+from tqdm.auto import tqdm
+
 
 def _get_processed_dir() -> Path:
     """
@@ -136,9 +138,10 @@ def compute_embeddings_for_subtask2a_deberta(
     model.eval()
 
     embeddings: list[np.ndarray] = []
-    with torch.no_grad():
-        for start in range(0, len(texts), batch_size):
-            batch_texts = texts[start : start + batch_size]
+    batch_starts = range(0, len(texts), batch_size)
+    for start in tqdm(batch_starts, desc="Subtask2A embeddings", unit="batch"):
+        batch_texts = texts[start : start + batch_size]
+        with torch.no_grad():
             encoded = tokenizer(
                 batch_texts,
                 truncation=True,
@@ -192,6 +195,11 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--run_id", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Quick/dev mode (subtask2a only): embeds only the first N rows to validate wiring.",
+    )
     args = parser.parse_args()
 
     repo_root = _get_repo_root()
@@ -221,6 +229,12 @@ def main() -> None:
     data = load_all_data(data_dir=str(repo_root / "data" / "raw"))
     df_raw = data["subtask2a"].copy()
     print(f"Loaded subtask2a rows: {len(df_raw)} from data_dir={repo_root / 'data' / 'raw'}")
+
+    quick_n = 512
+    if args.quick:
+        df_raw = df_raw.head(quick_n).copy()
+        print(f"[QUICK] Truncated subtask2a rows to first {len(df_raw)} (N={quick_n}).")
+
     embeddings, user_ids, text_ids = compute_embeddings_for_subtask2a_deberta(
         df_raw,
         model_name=args.model_name,
@@ -253,6 +267,8 @@ def main() -> None:
             "batch_size": args.batch_size,
             "device": args.device,
             "seed": args.seed,
+            "quick": bool(args.quick),
+            "quick_n": int(quick_n) if args.quick else None,
             "df_raw_len": int(len(df_raw)),
             "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "git_commit": get_git_commit(repo_root),

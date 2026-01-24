@@ -16,11 +16,10 @@ from src.eval.analysis_tools import (
     compute_delta_metrics,
     compute_subtask1_metrics_from_preds,
     compute_subtask1_slice_metrics,
-    load_frozen_split,
     make_seen_user_time_split,
     safe_pearsonr,
 )
-from src.eval.splits import get_repo_root
+from src.eval.splits import get_repo_root, load_frozen_split
 
 
 def _resolve_repo_path(path_str: str | None) -> Path | None:
@@ -186,7 +185,7 @@ def main() -> None:
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     run_id = args.run_id or ""
     model_tag_is_transformer = "transformer" in args.model_tag.lower()
-    if model_tag_is_transformer and not run_id and pred_path is None:
+    if model_tag_is_transformer and not run_id and args.pred_path is None:
         raise SystemExit("Transformer eval requires --run_id when --pred_path is not provided.")
     git_commit = _get_git_commit(repo_root)
     config_hash = _compute_config_hash(args)
@@ -301,6 +300,14 @@ def main() -> None:
 
     if args.task == "subtask2a":
         df2a = data["subtask2a"]
+        raw_path_2a = repo_root / "data" / "raw" / "train_subtask2a.csv"
+        if raw_path_2a.exists():
+            raw_df = pd.read_csv(raw_path_2a)
+            if len(df2a) != len(raw_df):
+                raise SystemExit(
+                    f"df2a rowcount mismatch: load_all_data returned {len(df2a)} rows "
+                    f"but CSV has {len(raw_df)}. Frozen split indices apply to df_raw."
+                )
         if args.regime == "unseen_user":
             split_path_2a = split_path
             if split_path_2a is None:
@@ -310,14 +317,35 @@ def main() -> None:
             train_idx, val_idx = load_frozen_split(split_path_2a, df2a)
         else:
             train_idx, val_idx = make_seen_user_time_split(df2a, val_frac=0.2)
-        val_df = df2a.iloc[val_idx].copy()
-        mask = val_df["state_change_valence"].notna() & val_df["state_change_arousal"].notna()
-        val_df = val_df.loc[mask].reset_index(drop=True)
+        if pred_path is None and not args.run_id:
+            raise SystemExit("Subtask2a eval requires --run_id or --pred_path.")
+        if pred_path is None:
+            pred_path = repo_root / args.pred_dir / f"subtask2a_val_user_preds__{args.run_id}.parquet"
 
-        y_true_delta_v = val_df["state_change_valence"].to_numpy(dtype=float)
-        y_true_delta_a = val_df["state_change_arousal"].to_numpy(dtype=float)
-        y_pred_delta_v = np.zeros_like(y_true_delta_v, dtype=float)
-        y_pred_delta_a = np.zeros_like(y_true_delta_a, dtype=float)
+        if not pred_path.exists():
+            raise SystemExit(f"Anchored preds not found: {pred_path}")
+
+        df_preds = pd.read_parquet(pred_path)
+        required_cols = {
+            "user_id",
+            "anchor_idx",
+            "anchor_text_id",
+            "anchor_timestamp",
+            "delta_valence_pred",
+            "delta_arousal_pred",
+            "delta_valence_true",
+            "delta_arousal_true",
+        }
+        missing = required_cols - set(df_preds.columns)
+        if missing:
+            raise SystemExit(f"Preds missing required columns {sorted(missing)} in {pred_path}")
+        if df_preds["user_id"].duplicated().any():
+            raise SystemExit(f"Preds must contain exactly one row per user in {pred_path}")
+
+        y_true_delta_v = df_preds["delta_valence_true"].to_numpy(dtype=float)
+        y_true_delta_a = df_preds["delta_arousal_true"].to_numpy(dtype=float)
+        y_pred_delta_v = df_preds["delta_valence_pred"].to_numpy(dtype=float)
+        y_pred_delta_a = df_preds["delta_arousal_pred"].to_numpy(dtype=float)
 
         metrics = compute_delta_metrics(
             y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
@@ -334,12 +362,13 @@ def main() -> None:
             }
         )
 
-        if args.write_per_user_diagnostics:
-            per_user_df = _per_user_delta(
-                val_df, y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
-            )
-            out_path = repo_root / "reports" / f"per_user_subtask2a_{run_id}.csv"
-            per_user_df.to_csv(out_path, index=False)
+        val_users_total = df2a.iloc[val_idx]["user_id"].nunique()
+        n_users_scored = df_preds["user_id"].nunique()
+        n_users_excluded = int(val_users_total - n_users_scored)
+        print(
+            f"Subtask2a anchored preds: n_users_scored={n_users_scored}, "
+            f"n_users_excluded_no_eligible={n_users_excluded}"
+        )
 
     if args.task == "subtask2b":
         df2b = data["subtask2b_user"]
