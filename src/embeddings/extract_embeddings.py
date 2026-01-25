@@ -139,7 +139,7 @@ def compute_embeddings_for_subtask2a_deberta(
 
     embeddings: list[np.ndarray] = []
     batch_starts = range(0, len(texts), batch_size)
-    for start in tqdm(batch_starts, desc="Subtask2A embeddings", unit="batch"):
+    for start in tqdm(batch_starts, desc="Embeddings computation", unit="batch"):
         batch_texts = texts[start : start + batch_size]
         with torch.no_grad():
             encoded = tokenizer(
@@ -158,6 +158,26 @@ def compute_embeddings_for_subtask2a_deberta(
     if emb.shape[0] != len(texts):
         raise RuntimeError("Embedding count does not match number of texts.")
     return emb, user_ids, text_ids
+
+
+def compute_embeddings_for_subtask2b_deberta(
+    df: pd.DataFrame,
+    model_name: str,
+    max_length: int,
+    batch_size: int,
+    device: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    required = {"user_id", "text_id", "text"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns for subtask2b embeddings: {sorted(missing)}")
+    return compute_embeddings_for_subtask2a_deberta(
+        df=df,
+        model_name=model_name,
+        max_length=max_length,
+        batch_size=batch_size,
+        device=device,
+    )
 
 
 def save_subtask1_embeddings(
@@ -188,13 +208,14 @@ def save_subtask1_embeddings(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Extract embeddings.")
-    parser.add_argument("--task", choices=["subtask1", "subtask2a"], default="subtask1")
+    parser.add_argument("--task", choices=["subtask1", "subtask2a", "subtask2b"], default="subtask1")
     parser.add_argument("--model_name", default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--run_id", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--output", type=str, default=None)
     parser.add_argument(
         "--quick",
         action="store_true",
@@ -219,64 +240,129 @@ def main() -> None:
         )
         return
 
-    if not args.run_id:
-        raise SystemExit("--run_id is required for subtask2a embeddings.")
-    if args.model_name != "microsoft/deberta-v3-base" or args.max_length != 256:
-        raise SystemExit(
-            "Subtask2a embeddings require --model_name microsoft/deberta-v3-base and --max_length 256."
+    if args.task == "subtask2a":
+        if not args.run_id:
+            raise SystemExit("--run_id is required for subtask2a embeddings.")
+        if args.model_name != "microsoft/deberta-v3-base" or args.max_length != 256:
+            raise SystemExit(
+                "Subtask2a embeddings require --model_name microsoft/deberta-v3-base and --max_length 256."
+            )
+
+        data = load_all_data(data_dir=str(repo_root / "data" / "raw"))
+        df_raw = data["subtask2a"].copy()
+        print(f"Loaded subtask2a rows: {len(df_raw)} from data_dir={repo_root / 'data' / 'raw'}")
+
+        quick_n = 512
+        if args.quick:
+            df_raw = df_raw.head(quick_n).copy()
+            print(f"[QUICK] Truncated subtask2a rows to first {len(df_raw)} (N={quick_n}).")
+
+        embeddings, user_ids, text_ids = compute_embeddings_for_subtask2a_deberta(
+            df_raw,
+            model_name=args.model_name,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            device=args.device,
         )
 
-    data = load_all_data(data_dir=str(repo_root / "data" / "raw"))
-    df_raw = data["subtask2a"].copy()
-    print(f"Loaded subtask2a rows: {len(df_raw)} from data_dir={repo_root / 'data' / 'raw'}")
+        processed_dir = _get_processed_dir()
+        out_path = processed_dir / f"subtask2a_embeddings__{args.run_id}.npz"
+        if out_path.exists():
+            raise FileExistsError(f"Embeddings file already exists: {out_path}")
+        np.savez_compressed(
+            out_path,
+            embeddings=embeddings,
+            user_id=user_ids,
+            text_id=text_ids,
+        )
+        npz_sha = sha256_file(out_path)
 
-    quick_n = 512
-    if args.quick:
-        df_raw = df_raw.head(quick_n).copy()
-        print(f"[QUICK] Truncated subtask2a rows to first {len(df_raw)} (N={quick_n}).")
+        merge_run_metadata(
+            repo_root=repo_root,
+            run_id=args.run_id,
+            updates={
+                "task": "subtask2a",
+                "task_tag": "subtask2a_embeddings",
+                "model_name": args.model_name,
+                "max_length": args.max_length,
+                "pooling": "cls",
+                "batch_size": args.batch_size,
+                "device": args.device,
+                "seed": args.seed,
+                "quick": bool(args.quick),
+                "quick_n": int(quick_n) if args.quick else None,
+                "df_raw_len": int(len(df_raw)),
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "git_commit": get_git_commit(repo_root),
+                "embeddings_path": str(out_path),
+                "embeddings_sha256": npz_sha,
+            },
+        )
+        print(f"Saved Subtask2A embeddings to: {out_path}")
+        return
 
-    embeddings, user_ids, text_ids = compute_embeddings_for_subtask2a_deberta(
-        df_raw,
-        model_name=args.model_name,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-        device=args.device,
-    )
+    if args.task == "subtask2b":
+        if not args.run_id:
+            raise SystemExit("--run_id is required for subtask2b embeddings.")
+        if args.model_name != "microsoft/deberta-v3-base" or args.max_length != 256:
+            raise SystemExit(
+                "Subtask2b embeddings require --model_name microsoft/deberta-v3-base and --max_length 256."
+            )
+        if args.device.startswith("cuda") and not torch.cuda.is_available():
+            raise SystemExit("CUDA requested but torch.cuda.is_available() is False.")
 
-    processed_dir = _get_processed_dir()
-    out_path = processed_dir / f"subtask2a_embeddings__{args.run_id}.npz"
-    if out_path.exists():
-        raise FileExistsError(f"Embeddings file already exists: {out_path}")
-    np.savez_compressed(
-        out_path,
-        embeddings=embeddings,
-        user_id=user_ids,
-        text_id=text_ids,
-    )
-    npz_sha = sha256_file(out_path)
+        data = load_all_data(data_dir=str(repo_root / "data" / "raw"))
+        df_raw = data["subtask2b"].copy()
+        print(f"Loaded subtask2b rows: {len(df_raw)} from data_dir={repo_root / 'data' / 'raw'}")
 
-    merge_run_metadata(
-        repo_root=repo_root,
-        run_id=args.run_id,
-        updates={
-            "task": "subtask2a",
-            "task_tag": "subtask2a_embeddings",
-            "model_name": args.model_name,
-            "max_length": args.max_length,
-            "pooling": "cls",
-            "batch_size": args.batch_size,
-            "device": args.device,
-            "seed": args.seed,
-            "quick": bool(args.quick),
-            "quick_n": int(quick_n) if args.quick else None,
-            "df_raw_len": int(len(df_raw)),
-            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "git_commit": get_git_commit(repo_root),
-            "embeddings_path": str(out_path),
-            "embeddings_sha256": npz_sha,
-        },
-    )
-    print(f"Saved Subtask2A embeddings to: {out_path}")
+        quick_n = 512
+        if args.quick:
+            df_raw = df_raw.head(quick_n).copy()
+            print(f"[QUICK] Truncated subtask2b rows to first {len(df_raw)} (N={quick_n}).")
+
+        embeddings, user_ids, text_ids = compute_embeddings_for_subtask2b_deberta(
+            df_raw,
+            model_name=args.model_name,
+            max_length=args.max_length,
+            batch_size=args.batch_size,
+            device=args.device,
+        )
+
+        processed_dir = _get_processed_dir()
+        out_path = processed_dir / f"subtask2b_embeddings__{args.run_id}.npz"
+        if out_path.exists():
+            raise FileExistsError(f"Embeddings file already exists: {out_path}")
+        np.savez_compressed(
+            out_path,
+            embeddings=embeddings,
+            user_id=user_ids,
+            text_id=text_ids,
+        )
+        npz_sha = sha256_file(out_path)
+
+        merge_run_metadata(
+            repo_root=repo_root,
+            run_id=args.run_id,
+            updates={
+                "task": "subtask2b",
+                "task_tag": "subtask2b_embeddings",
+                "model_name": args.model_name,
+                "max_length": args.max_length,
+                "pooling": "cls",
+                "batch_size": args.batch_size,
+                "device": args.device,
+                "seed": args.seed,
+                "quick": bool(args.quick),
+                "quick_n": int(quick_n) if args.quick else None,
+                "df_raw_len": int(len(df_raw)),
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "git_commit": get_git_commit(repo_root),
+                "embeddings_path": str(out_path),
+                "embeddings_sha256": npz_sha,
+            },
+        )
+        print(f"Saved Subtask2B embeddings to: {out_path}")
+        return
 
 
 if __name__ == "__main__":

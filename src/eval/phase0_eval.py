@@ -20,6 +20,8 @@ from src.eval.analysis_tools import (
     safe_pearsonr,
 )
 from src.eval.splits import get_repo_root, load_frozen_split
+from src.utils.provenance import merge_run_metadata, artifact_ref, get_git_snapshot, get_env_snapshot
+from src.utils.diagnostics import summarize_pred_df
 
 
 def _resolve_repo_path(path_str: str | None) -> Path | None:
@@ -91,12 +93,16 @@ def _append_eval_records(rows: List[Dict[str, Any]], path: Path) -> None:
         "r_between_arousal",
         "r_delta_valence",
         "r_delta_arousal",
+        "r_dispo_valence",
+        "r_dispo_arousal",
         "mae_valence",
         "mae_arousal",
         "mse_valence",
         "mse_arousal",
         "mae_delta_valence",
         "mae_delta_arousal",
+        "mae_dispo_valence",
+        "mae_dispo_arousal",
     ]
 
     columns = CANONICAL_COLUMNS
@@ -174,6 +180,7 @@ def main() -> None:
     parser.add_argument("--pred_dir", type=str, default="reports/preds")
     parser.add_argument("--split_path", type=str, default=None)
     parser.add_argument("--config_path", type=str, default=None)
+    parser.add_argument("--no_log", type=int, default=0)
     parser.add_argument(
         "--write_per_user_diagnostics",
         action="store_true",
@@ -325,6 +332,21 @@ def main() -> None:
         if not pred_path.exists():
             raise SystemExit(f"Anchored preds not found: {pred_path}")
 
+        if args.run_id:
+            merge_run_metadata(
+                repo_root=repo_root,
+                run_id=args.run_id,
+                updates={
+                    "task": "subtask2a",
+                    "stage": "eval",
+                    "seed": args.seed,
+                    "model_tag": args.model_tag,
+                    "inputs": {"preds_for_eval": artifact_ref(pred_path, repo_root)},
+                    "git": get_git_snapshot(repo_root),
+                    "env": get_env_snapshot(),
+                },
+            )
+
         df_preds = pd.read_parquet(pred_path)
         required_cols = {
             "user_id",
@@ -362,6 +384,45 @@ def main() -> None:
             }
         )
 
+        if args.run_id:
+            merge_run_metadata(
+                repo_root=repo_root,
+                run_id=args.run_id,
+                updates={
+                    "metrics": {"eval": metrics},
+                    "diagnostics": {
+                        "eval": {
+                            "subtask2a": {
+                                "val": summarize_pred_df(
+                                    df_preds,
+                                    pred_cols={
+                                        "valence": "delta_valence_pred",
+                                        "arousal": "delta_arousal_pred",
+                                    },
+                                    true_cols={
+                                        "valence": "delta_valence_true",
+                                        "arousal": "delta_arousal_true",
+                                    },
+                                    bounds={"valence": (-4.0, 4.0), "arousal": (-2.0, 2.0)},
+                                )
+                            }
+                        }
+                    },
+                    "config": {
+                        "eval": {
+                            "no_log": bool(args.no_log),
+                            "model_tag": args.model_tag,
+                            "task": args.task,
+                        }
+                    },
+                    "artifacts": {
+                        "eval_records": artifact_ref(
+                            repo_root / "reports" / "eval_records.csv", repo_root
+                        )
+                    },
+                },
+            )
+
         val_users_total = df2a.iloc[val_idx]["user_id"].nunique()
         n_users_scored = df_preds["user_id"].nunique()
         n_users_excluded = int(val_users_total - n_users_scored)
@@ -371,28 +432,62 @@ def main() -> None:
         )
 
     if args.task == "subtask2b":
-        df2b = data["subtask2b_user"]
+        if pred_path is None and not args.run_id:
+            raise SystemExit("Subtask2b eval requires --run_id or --pred_path.")
+        if pred_path is None:
+            pred_path = repo_root / args.pred_dir / f"subtask2b_val_user_preds__{args.run_id}.parquet"
+        if not pred_path.exists():
+            raise SystemExit(f"Preds not found: {pred_path}")
 
-        split_path_2b = repo_root / "reports" / "splits" / f"subtask2b_user_disposition_change_unseen_user_seed{args.seed}.json"
-        if not split_path_2b.exists():
-            raise SystemExit(f"Split file not found: {split_path_2b}")
-        train_idx, val_idx = load_frozen_split(split_path_2b, df2b)
+        if args.run_id:
+            merge_run_metadata(
+                repo_root=repo_root,
+                run_id=args.run_id,
+                updates={
+                    "task": "subtask2b",
+                    "stage": "eval",
+                    "seed": args.seed,
+                    "model_tag": args.model_tag,
+                    "inputs": {"preds_for_eval": artifact_ref(pred_path, repo_root)},
+                    "git": get_git_snapshot(repo_root),
+                    "env": get_env_snapshot(),
+                },
+            )
 
-        val_df = df2b.iloc[val_idx].copy()
-        mask = val_df["disposition_change_valence"].notna() & val_df[
-            "disposition_change_arousal"
-        ].notna()
-        val_df = val_df.loc[mask].reset_index(drop=True)
+        df_preds = pd.read_parquet(pred_path)
+        if df_preds["user_id"].duplicated().any():
+            raise SystemExit(f"Preds must contain exactly one row per user in {pred_path}")
 
-        y_true_delta_v = val_df["disposition_change_valence"].to_numpy(dtype=float)
-        y_true_delta_a = val_df["disposition_change_arousal"].to_numpy(dtype=float)
-        y_pred_delta_v = np.zeros_like(y_true_delta_v, dtype=float)
-        y_pred_delta_a = np.zeros_like(y_true_delta_a, dtype=float)
+        def _first_present(cols: list[str]) -> str:
+            for col in cols:
+                if col in df_preds.columns:
+                    return col
+            raise SystemExit(f"Preds missing required columns {cols} in {pred_path}")
 
-        metrics = compute_delta_metrics(
-            y_true_delta_v, y_pred_delta_v, y_true_delta_a, y_pred_delta_a
+        true_v_col = _first_present(
+            ["disposition_change_valence_true", "dispo_change_valence_true", "delta_valence_true"]
         )
-        primary_score = float(np.mean([metrics["r_delta_valence"], metrics["r_delta_arousal"]]))
+        true_a_col = _first_present(
+            ["disposition_change_arousal_true", "dispo_change_arousal_true", "delta_arousal_true"]
+        )
+        pred_v_col = _first_present(
+            ["disposition_change_valence_pred", "dispo_change_valence_pred", "delta_valence_pred"]
+        )
+        pred_a_col = _first_present(
+            ["disposition_change_arousal_pred", "dispo_change_arousal_pred", "delta_arousal_pred"]
+        )
+
+        y_true_v = df_preds[true_v_col].to_numpy(dtype=float)
+        y_true_a = df_preds[true_a_col].to_numpy(dtype=float)
+        y_pred_v = df_preds[pred_v_col].to_numpy(dtype=float)
+        y_pred_a = df_preds[pred_a_col].to_numpy(dtype=float)
+
+        r_dispo_valence = safe_pearsonr(y_true_v, y_pred_v, label="dispo_valence")
+        r_dispo_arousal = safe_pearsonr(y_true_a, y_pred_a, label="dispo_arousal")
+        mae_dispo_valence = float(np.mean(np.abs(y_true_v - y_pred_v)))
+        mae_dispo_arousal = float(np.mean(np.abs(y_true_a - y_pred_a)))
+        primary_score = float(np.mean([r_dispo_valence, r_dispo_arousal]))
+
         eval_rows.append(
             {
                 **identity,
@@ -400,9 +495,59 @@ def main() -> None:
                 "regime": args.regime,
                 "slice": "all",
                 "primary_score": primary_score,
-                **metrics,
+                "r_dispo_valence": r_dispo_valence,
+                "r_dispo_arousal": r_dispo_arousal,
+                "mae_dispo_valence": mae_dispo_valence,
+                "mae_dispo_arousal": mae_dispo_arousal,
             }
         )
+
+        if args.run_id:
+            merge_run_metadata(
+                repo_root=repo_root,
+                run_id=args.run_id,
+                updates={
+                    "metrics": {
+                        "eval": {
+                            "r_dispo_valence": r_dispo_valence,
+                            "r_dispo_arousal": r_dispo_arousal,
+                            "mae_dispo_valence": mae_dispo_valence,
+                            "mae_dispo_arousal": mae_dispo_arousal,
+                            "primary_score": primary_score,
+                        }
+                    },
+                    "diagnostics": {
+                        "eval": {
+                            "subtask2b": {
+                                "val": summarize_pred_df(
+                                    df_preds,
+                                    pred_cols={
+                                        "valence": pred_v_col,
+                                        "arousal": pred_a_col,
+                                    },
+                                    true_cols={
+                                        "valence": true_v_col,
+                                        "arousal": true_a_col,
+                                    },
+                                    bounds={"valence": (-4.0, 4.0), "arousal": (-2.0, 2.0)},
+                                )
+                            }
+                        }
+                    },
+                    "config": {
+                        "eval": {
+                            "no_log": bool(args.no_log),
+                            "model_tag": args.model_tag,
+                            "task": args.task,
+                        }
+                    },
+                    "artifacts": {
+                        "eval_records": artifact_ref(
+                            repo_root / "reports" / "eval_records.csv", repo_root
+                        )
+                    },
+                },
+            )
 
         if args.write_per_user_diagnostics:
             per_user_df = _per_user_delta(
@@ -412,7 +557,8 @@ def main() -> None:
             per_user_df.to_csv(out_path, index=False)
 
     eval_records_path = repo_root / "reports" / "eval_records.csv"
-    _append_eval_records(eval_rows, eval_records_path)
+    if not args.no_log:
+        _append_eval_records(eval_rows, eval_records_path)
     print(f"Appended {len(eval_rows)} eval records to {eval_records_path}")
 
 

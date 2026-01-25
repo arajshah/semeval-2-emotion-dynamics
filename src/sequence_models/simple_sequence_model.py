@@ -141,3 +141,50 @@ class TransformerSequenceRegressor(nn.Module):
         preds = self.fc(pooled)
         return preds
 
+
+class SequenceStateRegressor(nn.Module):
+    """
+    GRU-based sequence regressor with numeric state/history features.
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_features: int,
+        hidden_dim: int = 256,
+        num_layers: int = 1,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.norm = nn.LayerNorm(hidden_dim + num_features)
+        self.fc1 = nn.Linear(hidden_dim + num_features, hidden_dim)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, 2)
+
+    def forward(
+        self,
+        x_seq: torch.Tensor,
+        lengths: torch.Tensor,
+        x_num: torch.Tensor,
+    ) -> torch.Tensor:
+        lengths_cpu = lengths.cpu()
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x_seq, lengths_cpu, batch_first=True, enforce_sorted=False
+        )
+        _, h_n = self.gru(packed)
+        seq_repr = h_n[-1]
+        x = torch.cat([seq_repr, x_num], dim=1)
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        return self.fc2(x)
+
