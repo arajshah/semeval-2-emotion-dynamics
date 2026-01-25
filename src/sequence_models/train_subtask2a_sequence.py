@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -9,6 +10,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 
@@ -80,30 +82,52 @@ def _eval_anchors(
     y_true: np.ndarray,
     batch_size: int,
     device: torch.device,
+    *,
+    valence_loss_weight: float,
+    arousal_loss_weight: float,
+    valence_loss: str,
+    huber_delta: float,
+    legacy_loss: bool,
 ) -> Tuple[float, float, float]:
     model.eval()
     preds_list: List[np.ndarray] = []
-    loss_fn = nn.SmoothL1Loss()
     total_loss = 0.0
     total_count = 0
+
     with torch.no_grad():
         for start in range(0, len(X_seq), batch_size):
             end = start + batch_size
             x_seq = torch.from_numpy(X_seq[start:end]).to(device)
             lens = torch.from_numpy(lengths[start:end]).to(device)
             x_num = torch.from_numpy(X_num[start:end]).to(device)
+
             outputs = model(x_seq, lens, x_num)
             preds_list.append(outputs.cpu().numpy())
+
             y_batch = torch.from_numpy(y_true[start:end]).to(device)
-            loss = loss_fn(outputs, y_batch)
+            pred_v, pred_a = outputs[:, 0], outputs[:, 1]
+            true_v, true_a = y_batch[:, 0], y_batch[:, 1]
+
+            if legacy_loss:
+                loss_v = F.smooth_l1_loss(pred_v, true_v, beta=1.0)
+                loss_a = F.smooth_l1_loss(pred_a, true_a, beta=1.0)
+            else:
+                if valence_loss == "huber":
+                    loss_v = F.smooth_l1_loss(pred_v, true_v, beta=huber_delta)
+                else:
+                    loss_v = F.mse_loss(pred_v, true_v)
+                # Keep arousal as MSE (matches your current training logic)
+                loss_a = F.mse_loss(pred_a, true_a)
+
+            loss = valence_loss_weight * loss_v + arousal_loss_weight * loss_a
             total_loss += float(loss.item()) * len(x_seq)
             total_count += len(x_seq)
+
     preds = np.concatenate(preds_list, axis=0)
     r_v = safe_pearsonr(y_true[:, 0], preds[:, 0], label="val_delta_valence")
     r_a = safe_pearsonr(y_true[:, 1], preds[:, 1], label="val_delta_arousal")
     val_loss = total_loss / max(total_count, 1)
     return r_v, r_a, val_loss
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Subtask 2A Phase-C sequence model.")
@@ -125,6 +149,10 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--model_tag", default=None)
     parser.add_argument("--ablate_no_history", type=int, default=0)
+    parser.add_argument("--valence_loss_weight", type=float, default=1.0)
+    parser.add_argument("--arousal_loss_weight", type=float, default=1.0)
+    parser.add_argument("--valence_loss", choices=["mse", "huber"], default="mse")
+    parser.add_argument("--huber_delta", type=float, default=1.0)
     args = parser.parse_args()
 
     validate_run_id(args.run_id)
@@ -226,7 +254,7 @@ def main() -> None:
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
-    loss_fn = nn.SmoothL1Loss()
+    legacy_loss = False
 
     best_score = -1e9
     best_epoch = 0
@@ -237,6 +265,8 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
+        total_loss_v = 0.0
+        total_loss_a = 0.0
         total_count = 0
         for x_seq, lengths, x_num, y in tqdm(
             train_loader, desc=f"Epoch {epoch}", unit="batch"
@@ -247,15 +277,34 @@ def main() -> None:
             y = y.to(device)
             optimizer.zero_grad()
             outputs = model(x_seq, lengths, x_num)
-            loss = loss_fn(outputs, y)
+            if outputs.shape[-1] != 2:
+                raise SystemExit("Model outputs must have shape (B, 2) for ΔV/ΔA.")
+            pred_v = outputs[:, 0]
+            pred_a = outputs[:, 1]
+            true_v = y[:, 0]
+            true_a = y[:, 1]
+            if legacy_loss:
+                loss_v = F.smooth_l1_loss(pred_v, true_v, beta=1.0)
+                loss_a = F.smooth_l1_loss(pred_a, true_a, beta=1.0)
+            else:
+                if args.valence_loss == "huber":
+                    loss_v = F.smooth_l1_loss(pred_v, true_v, beta=args.huber_delta)
+                else:
+                    loss_v = F.mse_loss(pred_v, true_v)
+                loss_a = F.mse_loss(pred_a, true_a)
+            loss = args.valence_loss_weight * loss_v + args.arousal_loss_weight * loss_a
             loss.backward()
             if args.grad_clip and args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             total_loss += float(loss.item()) * len(x_seq)
+            total_loss_v += float(loss_v.item()) * len(x_seq)
+            total_loss_a += float(loss_a.item()) * len(x_seq)
             total_count += len(x_seq)
 
         train_loss = total_loss / max(total_count, 1)
+        train_loss_v = total_loss_v / max(total_count, 1)
+        train_loss_a = total_loss_a / max(total_count, 1)
         y_true_val = val_anchor_bundle["meta"][
             ["state_change_valence", "state_change_arousal"]
         ].to_numpy(dtype=float)
@@ -267,6 +316,11 @@ def main() -> None:
             y_true_val,
             args.batch_size,
             device,
+            valence_loss_weight=args.valence_loss_weight,
+            arousal_loss_weight=args.arousal_loss_weight,
+            valence_loss=args.valence_loss,
+            huber_delta=args.huber_delta,
+            legacy_loss=legacy_loss,
         )
         primary_score = float(np.mean([r_v, r_a]))
         trainlog_rows.append(
@@ -274,6 +328,8 @@ def main() -> None:
                 "run_id": args.run_id,
                 "epoch": epoch,
                 "train_loss": train_loss,
+                "train_loss_valence": train_loss_v,
+                "train_loss_arousal": train_loss_a,
                 "val_loss": val_loss,
                 "r_delta_valence": r_v,
                 "r_delta_arousal": r_a,
@@ -281,7 +337,9 @@ def main() -> None:
             }
         )
         print(
-            f"Epoch {epoch}: train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"Epoch {epoch}: train_loss={train_loss:.4f} "
+            f"lossV={train_loss_v:.4f} lossA={train_loss_a:.4f} "
+            f"val_loss={val_loss:.4f} "
             f"rΔV={r_v:.4f} rΔA={r_a:.4f} primary={primary_score:.4f}"
         )
 
@@ -360,6 +418,11 @@ def main() -> None:
                     "subtask2a": {
                         "seq_len": resolved_seq_len,
                         "ablate_no_history": bool(args.ablate_no_history),
+                        "valence_loss_weight": args.valence_loss_weight,
+                        "arousal_loss_weight": args.arousal_loss_weight,
+                        "valence_loss": args.valence_loss,
+                        "huber_delta": args.huber_delta,
+                        "legacy_loss": legacy_loss,
                     }
                 }
             },
