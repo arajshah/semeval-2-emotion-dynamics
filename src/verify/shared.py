@@ -2,15 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import csv
 import importlib
 import json
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
+
+from src.utils.provenance import merge_run_metadata
 
 
 @dataclass
@@ -33,6 +36,7 @@ class VerifyContext:
     tasks: List[str]
     seed: int
     run_id: Optional[str] = None
+    allow_warn: bool = False
 
 
 def pass_result(check_id: str, message: str) -> CheckResult:
@@ -49,6 +53,55 @@ def warn_result(check_id: str, message: str, hint: Optional[str] = None) -> Chec
     return CheckResult(
         check_id=check_id, passed=True, message=message, hint=hint, severity="WARN"
     )
+
+
+def audit_record(
+    name: str,
+    status: str,
+    message: str,
+    details: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    if status not in {"PASS", "WARN", "FAIL"}:
+        status = "WARN"
+    record: Dict[str, Any] = {
+        "name": name,
+        "status": status,
+        "message": message,
+    }
+    if details is not None:
+        record["details"] = details
+    return record
+
+
+def write_audits_to_manifest(
+    repo_root: Path,
+    run_id: str,
+    task: str,
+    audits: List[Dict[str, Any]],
+) -> None:
+    try:
+        merge_run_metadata(
+            repo_root=repo_root,
+            run_id=run_id,
+            updates={
+                "audits": {
+                    "phaseE2": {
+                        "task": task,
+                        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "results": audits,
+                    }
+                }
+            },
+        )
+    except Exception as exc:
+        audits.append(
+            audit_record(
+                name="phaseE2_manifest_write",
+                status="WARN",
+                message="Could not update run manifest",
+                details={"error": str(exc)},
+            )
+        )
 
 
 def print_results(header: str, results: List[CheckResult]) -> None:
