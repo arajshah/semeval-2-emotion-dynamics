@@ -9,6 +9,7 @@ import pandas as pd
 REQUIRED_COLS = [
     "user_id",
     "anchor_idx",
+    "anchor_text_id",
     "anchor_timestamp",
     "delta_valence_pred",
     "delta_arousal_pred",
