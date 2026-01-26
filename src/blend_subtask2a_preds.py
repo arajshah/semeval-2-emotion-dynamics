@@ -65,7 +65,12 @@ def main() -> None:
     key_cols = _parse_key_cols(args.key_cols)
 
     if args.strict:
-        forbidden = {"anchor_timestamp", "delta_valence_true", "delta_arousal_true"}
+        forbidden = {
+            "anchor_text_id",
+            "anchor_timestamp",
+            "delta_valence_true",
+            "delta_arousal_true",
+        }
         bad = [c for c in key_cols if c in forbidden]
         if bad:
             raise ValueError(
@@ -97,24 +102,34 @@ def main() -> None:
             )
 
     if args.strict:
-        ts_a = merged["anchor_timestamp_a"].astype("string")
-        ts_b = merged["anchor_timestamp_b"].astype("string")
-        if not ts_a.equals(ts_b):
-            raise ValueError("Strict mismatch in anchor_timestamp between A and B (after normalization).")
+        ts_a_dt = pd.to_datetime(merged["anchor_timestamp_a"], utc=True, errors="raise")
+        ts_b_dt = pd.to_datetime(merged["anchor_timestamp_b"], utc=True, errors="raise")
+        if not (ts_a_dt.view("int64") == ts_b_dt.view("int64")).all():
+            raise ValueError(
+                "Strict mismatch in anchor_timestamp between A and B (after UTC normalization)."
+            )
+
+        text_a = merged["anchor_text_id_a"].astype("string")
+        text_b = merged["anchor_text_id_b"].astype("string")
+        if not text_a.equals(text_b):
+            raise ValueError("Strict mismatch in anchor_text_id between A and B.")
 
         for col in ["delta_valence_true", "delta_arousal_true"]:
-            a_col = f"{col}_a"
-            b_col = f"{col}_b"
-            if not merged[a_col].equals(merged[b_col]):
+            a = pd.to_numeric(merged[f"{col}_a"], errors="raise")
+            b = pd.to_numeric(merged[f"{col}_b"], errors="raise")
+            if not a.equals(b):
                 raise ValueError(f"Strict mismatch in {col} between A and B.")
+
+    anchor_timestamp_out = ts_a_dt.dt.strftime("%Y-%m-%dT%H:%M:%S%z").astype("string")
 
     out_df = pd.DataFrame(
         {
-            "user_id": merged["user_id"],
-            "anchor_idx": merged["anchor_idx"],
-            "anchor_timestamp": ts_a,
-            "delta_valence_true": merged["delta_valence_true_a"],
-            "delta_arousal_true": merged["delta_arousal_true_a"],
+            "user_id": merged["user_id"].astype("string"),
+            "anchor_idx": pd.to_numeric(merged["anchor_idx"], errors="raise").astype("int64"),
+            "anchor_text_id": merged["anchor_text_id_a"].astype("string"),
+            "anchor_timestamp": anchor_timestamp_out,
+            "delta_valence_true": pd.to_numeric(merged["delta_valence_true_a"], errors="raise"),
+            "delta_arousal_true": pd.to_numeric(merged["delta_arousal_true_a"], errors="raise"),
             "delta_valence_pred": args.alpha_valence * merged["delta_valence_pred_a"]
             + (1.0 - args.alpha_valence) * merged["delta_valence_pred_b"],
             "delta_arousal_pred": args.alpha_arousal * merged["delta_arousal_pred_a"]
