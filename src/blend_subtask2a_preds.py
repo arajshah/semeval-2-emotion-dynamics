@@ -149,17 +149,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# Example usage:
-# python -m src.blend_subtask2a_preds \
-#   --pred_a reports/preds/subtask2a_val_user_preds__RUN_A.parquet \
-#   --pred_b reports/preds/subtask2a_val_user_preds__RUN_B_LINEAR_PREV.parquet \
-#   --alpha_valence 0.70 \
-#   --alpha_arousal 0.70 \
-#   --out_path reports/preds/subtask2a_val_user_preds__BLEND_TEST.parquet
-#
-# Then eval:
-# python -m src.eval.phase0_eval --task subtask2a --regime unseen_user --seed 42 \
-#   --run_id 'blend_test' --model_tag 'blend(alpha=0.7)' \
-#   --pred_path reports/preds/subtask2a_val_user_preds__BLEND_TEST.parquet \
-#   --split_path reports/splits/subtask2a_unseen_user_seed42.json

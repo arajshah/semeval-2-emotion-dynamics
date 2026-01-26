@@ -144,16 +144,17 @@ class TransformerSequenceRegressor(nn.Module):
 
 class SequenceStateRegressor(nn.Module):
     """
-    GRU-based sequence regressor with numeric state/history features.
+    GRU-based sequence regressor with optional numeric-feature encoding.
     """
 
     def __init__(
         self,
         embedding_dim: int,
-        num_features: int,
+        num_features: int = 0,
         hidden_dim: int = 256,
         num_layers: int = 1,
         dropout: float = 0.2,
+        use_numeric_features: bool = False,
     ) -> None:
         super().__init__()
         self.gru = nn.GRU(
@@ -163,8 +164,23 @@ class SequenceStateRegressor(nn.Module):
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
         )
-        self.norm = nn.LayerNorm(hidden_dim + num_features)
-        self.fc1 = nn.Linear(hidden_dim + num_features, hidden_dim)
+        self.use_numeric_features = use_numeric_features
+        self.num_features = int(num_features)
+        if self.use_numeric_features:
+            if self.num_features <= 0:
+                raise ValueError("numeric_feature_dim must be > 0 when use_numeric_features=True.")
+            self.numeric_mlp = nn.Sequential(
+                nn.Linear(self.num_features, 64),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+            fused_dim = hidden_dim + 64
+        else:
+            self.numeric_mlp = None
+            fused_dim = hidden_dim + self.num_features
+
+        self.norm = nn.LayerNorm(fused_dim)
+        self.fc1 = nn.Linear(fused_dim, hidden_dim)
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden_dim, 2)
@@ -173,7 +189,7 @@ class SequenceStateRegressor(nn.Module):
         self,
         x_seq: torch.Tensor,
         lengths: torch.Tensor,
-        x_num: torch.Tensor,
+        numeric_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         lengths_cpu = lengths.cpu()
         packed = nn.utils.rnn.pack_padded_sequence(
@@ -181,7 +197,20 @@ class SequenceStateRegressor(nn.Module):
         )
         _, h_n = self.gru(packed)
         seq_repr = h_n[-1]
-        x = torch.cat([seq_repr, x_num], dim=1)
+        if numeric_features is None:
+            if self.num_features > 0:
+                raise ValueError("numeric_features is required when num_features > 0.")
+            numeric_features = seq_repr.new_zeros((seq_repr.shape[0], 0))
+        numeric_features = numeric_features.to(seq_repr.dtype)
+        if numeric_features.shape[1] != self.num_features:
+            raise ValueError(
+                f"numeric_features dim mismatch: expected {self.num_features}, got {numeric_features.shape[1]}."
+            )
+        if self.use_numeric_features:
+            num_repr = self.numeric_mlp(numeric_features)
+            x = torch.cat([seq_repr, num_repr], dim=1)
+        else:
+            x = torch.cat([seq_repr, numeric_features], dim=1)
         x = self.norm(x)
         x = self.fc1(x)
         x = self.act(x)

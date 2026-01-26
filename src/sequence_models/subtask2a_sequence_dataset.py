@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -10,7 +10,129 @@ from torch.utils.data import Dataset, DataLoader
 
 from src.data_loader import load_all_data
 from src.eval.splits import load_frozen_split
+from src.sequence_models.baselines_subtask2a import (
+    add_prev_delta_features,
+    fit_linear_prev,
+    predict_linear_prev,
+    LinearPrevModel,
+)
 
+EMA_ALPHA = 0.3
+NUMERIC_FEATURE_COLS = [
+    "dv_prev",
+    "da_prev",
+    "dv_prev_missing",
+    "da_prev_missing",
+    "dt_prev_seconds",
+    "history_len",
+    "dv_mean_prev",
+    "da_mean_prev",
+    "dv_ema_prev",
+    "da_ema_prev",
+    "base_pred_dv",
+    "base_pred_da",
+]
+
+def _linear_prev_from_stats(stats: Dict) -> LinearPrevModel:
+    """
+    Reconstruct a LinearPrevModel from a serialized dict stored in norm_stats.
+    """
+    return LinearPrevModel(
+        coef_valence=np.asarray(stats["coef_valence"], dtype=float),
+        coef_arousal=np.asarray(stats["coef_arousal"], dtype=float),
+        feature_names=tuple(stats.get("feature_names", ("intercept", "dv_prev", "da_prev"))),
+        fit_rows=int(stats.get("fit_rows", 0)),
+        n_users=int(stats.get("n_users", 0)),
+    )
+
+
+def _finalize_numeric_feature_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enforce: all NUMERIC_FEATURE_COLS exist, are finite, float32, and filled with 0.0 where undefined.
+    """
+    out = df.copy()
+
+    if "dv_prev" not in out.columns or "da_prev" not in out.columns:
+        raise ValueError("Expected dv_prev/da_prev to exist before finalize_numeric_feature_cols().")
+
+    out["dv_prev_missing"] = out["dv_prev"].isna()
+    out["da_prev_missing"] = out["da_prev"].isna()
+
+    # Fill required columns
+    fill0 = [
+        "dv_prev",
+        "da_prev",
+        "dt_prev_seconds",
+        "history_len",
+        "dv_mean_prev",
+        "da_mean_prev",
+        "dv_ema_prev",
+        "da_ema_prev",
+        "base_pred_dv",
+        "base_pred_da",
+    ]
+    for c in fill0:
+        if c not in out.columns:
+            raise ValueError(f"Expected numeric feature column missing: {c}")
+        out[c] = out[c].fillna(0.0)
+
+    # Cast flags to 0/1 float
+    out["dv_prev_missing"] = out["dv_prev_missing"].astype(np.float32)
+    out["da_prev_missing"] = out["da_prev_missing"].astype(np.float32)
+
+    # Cast everything in NUMERIC_FEATURE_COLS to float32
+    for c in NUMERIC_FEATURE_COLS:
+        out[c] = out[c].astype(np.float32)
+
+    # Hard check: no NaNs/infs
+    nf = out[NUMERIC_FEATURE_COLS].to_numpy(dtype=np.float32, copy=False)
+    if not np.isfinite(nf).all():
+        bad = np.where(~np.isfinite(nf))
+        raise RuntimeError(f"Non-finite numeric features found at positions (row,col): {list(zip(bad[0][:10], bad[1][:10]))}")
+
+    return out
+
+
+def _attach_c2_features(
+    df: pd.DataFrame,
+    *,
+    baseline_model: Optional[LinearPrevModel],
+    fit_baseline_on: Optional[pd.DataFrame],
+) -> Tuple[pd.DataFrame, LinearPrevModel]:
+    """
+    Canonical C2 feature attachment:
+      1) prev-delta features: dv_prev/da_prev + missing flags (based on state_change columns)
+      2) history aggregates: dt_prev_seconds/history_len/running means/EMA
+      3) linear(prev) base preds: base_pred_dv/base_pred_da (fit on TRAIN only; applied to any df)
+      4) finalize NUMERIC_FEATURE_COLS as float32 + finite
+    """
+    out = df.copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="raise")
+    out = out.sort_values(["user_id", "timestamp", "text_id"], kind="mergesort")
+
+    # 1) prev-delta features: based on *state_change_* history (not valence diffs)
+    out = add_prev_delta_features(out)
+
+    # 2) history aggregates (deterministic)
+    out = _add_history_features(out)
+
+    # 3) baseline model: fit on TRAIN ONLY if not provided
+    if baseline_model is None:
+        fit_df = fit_baseline_on if fit_baseline_on is not None else out
+        baseline_model = fit_linear_prev(fit_df)
+
+    # attach baseline predictions (safe: val never used for fitting if caller passes train-fit model)
+    out = predict_linear_prev(
+        out,
+        baseline_model,
+        fill_value=0.0,
+        out_v_col="base_pred_dv",
+        out_a_col="base_pred_da",
+    )
+
+    # 4) finalize schema
+    out = _finalize_numeric_feature_cols(out)
+    return out, baseline_model
 
 def load_subtask2a_with_embeddings(
     embeddings_path: Path | str = Path("data/processed/subtask1_embeddings_all-MiniLM-L6-v2.npz"),
@@ -424,94 +546,177 @@ def select_forecast_anchors(
     return out
 
 
+def _add_history_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds:
+      - dt_prev_seconds
+      - history_len (count of prior eligible labeled rows per user)
+      - dv_mean_prev/da_mean_prev (running mean of prior deltas)
+      - dv_ema_prev/da_ema_prev (EMA of prior deltas; alpha=EMA_ALPHA)
+    Requires df to have:
+      - user_id, timestamp, text_id
+      - state_change_valence, state_change_arousal
+    Returns a copy with new columns.
+    """
+    working = df.copy()
+    working["timestamp"] = pd.to_datetime(working["timestamp"], errors="raise")
+    working = working.sort_values(
+        ["user_id", "timestamp", "text_id"], kind="mergesort"
+    )
+
+    eligible = working["state_change_valence"].notna() & working[
+        "state_change_arousal"
+    ].notna()
+    working["_eligible"] = eligible
+
+    working["dt_prev_seconds"] = (
+        working.groupby("user_id", sort=False)["timestamp"]
+        .diff()
+        .dt.total_seconds()
+        .fillna(0.0)
+    )
+
+    def _compute_group(group: pd.DataFrame) -> pd.DataFrame:
+        elig = group["_eligible"]
+        dv = group["state_change_valence"].astype(float)
+        da = group["state_change_arousal"].astype(float)
+
+        count_prev = elig.cumsum().shift(1).fillna(0)
+        dv_cum = dv.where(elig, 0.0).cumsum().shift(1).fillna(0.0)
+        da_cum = da.where(elig, 0.0).cumsum().shift(1).fillna(0.0)
+        count_safe = count_prev.replace(0, 1)
+
+        group["history_len"] = count_prev.astype(int)
+        group["dv_mean_prev"] = np.where(
+            count_prev.to_numpy() > 0, (dv_cum / count_safe).to_numpy(), 0.0
+        )
+        group["da_mean_prev"] = np.where(
+            count_prev.to_numpy() > 0, (da_cum / count_safe).to_numpy(), 0.0
+        )
+
+        dv_series = dv.where(elig)
+        da_series = da.where(elig)
+
+        group["dv_ema_prev"] = (
+            dv_series.ewm(alpha=EMA_ALPHA, adjust=False, ignore_na=True)
+            .mean().shift(1).fillna(0.0)
+        )
+        group["da_ema_prev"] = (
+            da_series.ewm(alpha=EMA_ALPHA, adjust=False, ignore_na=True)
+            .mean().shift(1).fillna(0.0)
+        )
+        return group
+
+    working = working.groupby("user_id", sort=False, group_keys=False).apply(
+        _compute_group
+    )
+    working = working.drop(columns=["_eligible"])
+    return working.sort_index()
+
+
+def _fit_and_attach_linear_prev(
+    train_df: pd.DataFrame, val_df: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, LinearPrevModel]:
+    """
+    Fit linear(prev) on train_df ONLY, then attach baseline preds to both train and val.
+    Adds columns base_pred_dv, base_pred_da (float).
+    """
+    model = fit_linear_prev(train_df)
+    train_out = predict_linear_prev(
+        train_df,
+        model,
+        fill_value=0.0,
+        out_v_col="base_pred_dv",
+        out_a_col="base_pred_da",
+    )
+    val_out = predict_linear_prev(
+        val_df,
+        model,
+        fill_value=0.0,
+        out_v_col="base_pred_dv",
+        out_a_col="base_pred_da",
+    )
+    return train_out, val_out, model
+
+
 def _build_sequence_and_features(
     user_df: pd.DataFrame,
     embeddings: np.ndarray,
     seq_len: int,
-    k_state: int,
-    target_idx_set: set[int] | None,
+    target_idx_set: Optional[Set[int]],
     require_eligible: bool,
-) -> Tuple[List[np.ndarray], List[int], List[np.ndarray], List[np.ndarray], List[dict]]:
+    *,
+    include_numeric_features: bool,
+) -> Tuple[
+    List[np.ndarray],
+    List[int],
+    List[np.ndarray],
+    List[np.ndarray],
+    List[np.ndarray],
+    List[dict],
+]:
     sequences: List[np.ndarray] = []
     lengths: List[int] = []
     x_num_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
+    base_pred_list: List[np.ndarray] = []
     meta_rows: List[dict] = []
 
-    v_vals = user_df["valence"].to_numpy(dtype=float)
-    a_vals = user_df["arousal"].to_numpy(dtype=float)
     idx_vals = user_df["idx"].to_numpy(dtype=int)
     emb_idx_vals = user_df["emb_index"].to_numpy(dtype=int)
     text_ids = user_df["text_id"].to_numpy()
     timestamps = user_df["timestamp"].to_numpy()
-    delta_v = user_df["state_change_valence"].to_numpy()
-    delta_a = user_df["state_change_arousal"].to_numpy()
+
+    delta_v = user_df["state_change_valence"].to_numpy(dtype=float)
+    delta_a = user_df["state_change_arousal"].to_numpy(dtype=float)
 
     for i in range(len(user_df)):
         idx = int(idx_vals[i])
         if target_idx_set is not None and idx not in target_idx_set:
             continue
+
         eligible = not (np.isnan(delta_v[i]) or np.isnan(delta_a[i]))
         if require_eligible and not eligible:
             continue
 
-        hist_start = max(0, i - k_state + 1)
-        v_hist = v_vals[: i + 1]
-        a_hist = a_vals[: i + 1]
-        v_recent = v_vals[hist_start : i + 1]
-        a_recent = a_vals[hist_start : i + 1]
-
-        v_curr = float(v_vals[i])
-        a_curr = float(a_vals[i])
-        v_mean_run = float(np.mean(v_hist))
-        a_mean_run = float(np.mean(a_hist))
-        v_mean_recent = float(np.mean(v_recent))
-        a_mean_recent = float(np.mean(a_recent))
-        v_std_recent = float(np.std(v_recent)) if len(v_recent) > 1 else 0.0
-        a_std_recent = float(np.std(a_recent)) if len(a_recent) > 1 else 0.0
-        dv_prev = float(v_vals[i] - v_vals[i - 1]) if i > 0 else 0.0
-        da_prev = float(a_vals[i] - a_vals[i - 1]) if i > 0 else 0.0
-
+        # sequence window up to i
         hist_emb_idx = emb_idx_vals[: i + 1]
         start = max(0, len(hist_emb_idx) - seq_len)
         window_idx = hist_emb_idx[start:]
+
         seq = np.zeros((seq_len, embeddings.shape[1]), dtype=np.float32)
         seq[seq_len - len(window_idx) :] = embeddings[window_idx]
 
         sequences.append(seq)
         lengths.append(len(window_idx))
-        x_num_list.append(
-            np.array(
-                [
-                    v_curr,
-                    a_curr,
-                    v_mean_run,
-                    a_mean_run,
-                    v_mean_recent,
-                    a_mean_recent,
-                    v_std_recent,
-                    a_std_recent,
-                    dv_prev,
-                    da_prev,
-                ],
-                dtype=np.float32,
-            )
-        )
+
+        # target: always true delta (residualization happens outside if desired)
         y_list.append(np.array([delta_v[i], delta_a[i]], dtype=np.float32))
+
+        # baseline preds must come from train-fit linear(prev), already attached as columns
+        base_pred = np.array(
+            [float(user_df.iloc[i]["base_pred_dv"]), float(user_df.iloc[i]["base_pred_da"])],
+            dtype=np.float32,
+        )
+        base_pred_list.append(base_pred)
+
+        # numeric features: canonical C2 schema
+        if include_numeric_features:
+            feats = user_df.iloc[i][NUMERIC_FEATURE_COLS].to_numpy(dtype=np.float32)
+            x_num_list.append(feats)
+
         meta_rows.append(
             {
                 "idx": idx,
                 "user_id": user_df["user_id"].iloc[i],
                 "text_id": text_ids[i],
                 "timestamp": timestamps[i],
-                "valence": v_vals[i],
-                "arousal": a_vals[i],
-                "state_change_valence": delta_v[i],
-                "state_change_arousal": delta_a[i],
+                "state_change_valence": float(delta_v[i]) if not np.isnan(delta_v[i]) else np.nan,
+                "state_change_arousal": float(delta_a[i]) if not np.isnan(delta_a[i]) else np.nan,
             }
         )
 
-    return sequences, lengths, x_num_list, y_list, meta_rows
+    return sequences, lengths, x_num_list, y_list, base_pred_list, meta_rows
 
 
 def build_subtask2a_step_dataset(
@@ -519,10 +724,11 @@ def build_subtask2a_step_dataset(
     split_idx: np.ndarray,
     embeddings_path: Path | str,
     seq_len: int,
-    k_state: int,
+    k_state: int,  # kept for signature compatibility; unused in C2 numeric feature path
     fit_norm: bool,
     norm_stats: dict | None = None,
     ablate_no_history: bool = False,
+    use_residual_targets: bool = False,
 ) -> dict:
     df_subset = df_raw.iloc[split_idx].copy()
     df_subset["idx"] = np.asarray(split_idx, dtype=int)
@@ -544,71 +750,99 @@ def build_subtask2a_step_dataset(
             f"Embeddings coverage mismatch: {len(df_subset)} raw rows -> {len(merged)} after merge. "
             f"Missing keys (sample): {sample}"
         )
+
     merged = merged.sort_values("row_pos", kind="stable").drop(columns=["row_pos"])
     merged["timestamp"] = pd.to_datetime(merged["timestamp"], errors="raise")
+
+    # Attach C2 features + linear(prev) baseline preds
+    baseline_model = None
+    if not fit_norm:
+        if norm_stats is None or "linear_prev" not in norm_stats:
+            raise ValueError("norm_stats with key 'linear_prev' required when fit_norm=False.")
+        baseline_model = _linear_prev_from_stats(norm_stats["linear_prev"])
+
+    merged, baseline_model = _attach_c2_features(
+        merged,
+        baseline_model=baseline_model,
+        fit_baseline_on=merged if fit_norm else None,
+    )
 
     sequences: List[np.ndarray] = []
     lengths: List[int] = []
     x_num_list: List[np.ndarray] = []
     y_list: List[np.ndarray] = []
+    base_pred_list: List[np.ndarray] = []
     meta_rows: List[dict] = []
 
     for _, group in merged.groupby("user_id", sort=False):
         group_sorted = group.sort_values("timestamp", kind="stable").reset_index(drop=True)
-        seqs, lens, nums, ys, metas = _build_sequence_and_features(
+        seqs, lens, nums, ys, base_preds, metas = _build_sequence_and_features(
             group_sorted,
             embeddings,
             seq_len,
-            k_state,
             target_idx_set=None,
             require_eligible=True,
+            include_numeric_features=True,
         )
         sequences.extend(seqs)
         lengths.extend(lens)
         x_num_list.extend(nums)
         y_list.extend(ys)
+        base_pred_list.extend(base_preds)
         meta_rows.extend(metas)
 
     X_seq = np.stack(sequences, axis=0).astype(np.float32) if sequences else np.zeros((0, seq_len, embeddings.shape[1]), dtype=np.float32)
     lengths_arr = np.array(lengths, dtype=np.int64)
-    X_num = np.stack(x_num_list, axis=0).astype(np.float32) if x_num_list else np.zeros((0, 10), dtype=np.float32)
+
+    n_feats = len(NUMERIC_FEATURE_COLS)
+    X_num = np.stack(x_num_list, axis=0).astype(np.float32) if x_num_list else np.zeros((0, n_feats), dtype=np.float32)
     y = np.stack(y_list, axis=0).astype(np.float32) if y_list else np.zeros((0, 2), dtype=np.float32)
+    base_pred = np.stack(base_pred_list, axis=0).astype(np.float32) if base_pred_list else np.zeros((0, 2), dtype=np.float32)
     meta = pd.DataFrame(meta_rows)
 
-    feature_names = [
-        "v_curr",
-        "a_curr",
-        "v_mean_run",
-        "a_mean_run",
-        "v_mean_recent",
-        "a_mean_recent",
-        "v_std_recent",
-        "a_std_recent",
-        "dv_prev",
-        "da_prev",
-    ]
+    # Normalization stats: computed on TRAIN only (fit_norm=True)
     if fit_norm:
-        mean = X_num.mean(axis=0) if len(X_num) else np.zeros((len(feature_names),), dtype=np.float32)
-        std = X_num.std(axis=0) if len(X_num) else np.ones((len(feature_names),), dtype=np.float32)
+        mean = X_num.mean(axis=0) if len(X_num) else np.zeros((n_feats,), dtype=np.float32)
+        std = X_num.std(axis=0) if len(X_num) else np.ones((n_feats,), dtype=np.float32)
         std = np.where(std == 0, 1.0, std)
+
         norm_stats = {
-            "feature_names": feature_names,
+            "feature_names": list(NUMERIC_FEATURE_COLS),
             "mean": mean.tolist(),
             "std": std.tolist(),
+            "linear_prev": {
+                "coef_valence": baseline_model.coef_valence.tolist(),
+                "coef_arousal": baseline_model.coef_arousal.tolist(),
+                "feature_names": list(baseline_model.feature_names),
+                "fit_rows": int(getattr(baseline_model, "fit_rows", 0)),
+                "n_users": int(getattr(baseline_model, "n_users", 0)),
+            },
         }
+
     if norm_stats is None:
         raise ValueError("norm_stats required when fit_norm is False.")
+
     mean = np.asarray(norm_stats["mean"], dtype=np.float32)
     std = np.asarray(norm_stats["std"], dtype=np.float32)
+    if mean.shape[0] != X_num.shape[1] or std.shape[0] != X_num.shape[1]:
+        raise ValueError(
+            f"norm_stats mean/std dim mismatch: mean={mean.shape}, std={std.shape}, X_num={X_num.shape}"
+        )
+
     X_num = (X_num - mean) / std
+
     if ablate_no_history:
         X_num[:] = 0.0
+
+    y_resid = (y - base_pred) if use_residual_targets else None
 
     return {
         "X_seq": X_seq,
         "lengths": lengths_arr,
         "X_num": X_num,
         "y": y,
+        "y_resid": y_resid,
+        "base_pred": base_pred,
         "meta": meta,
         "norm_stats": norm_stats,
     }
@@ -619,17 +853,27 @@ def build_subtask2a_anchor_features(
     anchors_df: pd.DataFrame,
     embeddings_path: Path | str,
     seq_len: int,
-    k_state: int,
+    k_state: int,  # kept for signature compatibility; unused in C2 numeric feature path
     norm_stats: dict,
     ablate_no_history: bool = False,
+    include_residual_targets: bool = False,
 ) -> dict:
+    n_feats = len(NUMERIC_FEATURE_COLS)
+
     if anchors_df.empty:
         return {
             "X_seq": np.zeros((0, seq_len, 0), dtype=np.float32),
             "lengths": np.array([], dtype=np.int64),
-            "X_num": np.zeros((0, 10), dtype=np.float32),
+            "X_num": np.zeros((0, n_feats), dtype=np.float32),
+            "base_pred": np.zeros((0, 2), dtype=np.float32),
             "meta": pd.DataFrame(),
         }
+
+    if "linear_prev" not in norm_stats:
+        raise ValueError("norm_stats must include 'linear_prev' to build anchored features without leakage.")
+
+    baseline_model = _linear_prev_from_stats(norm_stats["linear_prev"])
+
     df_raw = df_raw.copy()
     df_raw["idx"] = df_raw.index
     target_idx_set = set(anchors_df["anchor_idx"].astype(int).tolist())
@@ -652,36 +896,55 @@ def build_subtask2a_anchor_features(
         )
     merged["timestamp"] = pd.to_datetime(merged["timestamp"], errors="raise")
 
+    # Attach C2 features using TRAIN-fit baseline model from norm_stats
+    merged, _ = _attach_c2_features(
+        merged,
+        baseline_model=baseline_model,
+        fit_baseline_on=None,
+    )
+
     sequences: List[np.ndarray] = []
     lengths: List[int] = []
     x_num_list: List[np.ndarray] = []
     meta_rows: List[dict] = []
+    base_pred_list: List[np.ndarray] = []
 
     for _, group in merged.groupby("user_id", sort=False):
         group_sorted = group.sort_values("timestamp", kind="stable").reset_index(drop=True)
-        seqs, lens, nums, _, metas = _build_sequence_and_features(
+        seqs, lens, nums, ys, base_preds, metas = _build_sequence_and_features(
             group_sorted,
             embeddings,
             seq_len,
-            k_state,
             target_idx_set=target_idx_set,
             require_eligible=False,
+            include_numeric_features=True,
         )
         sequences.extend(seqs)
         lengths.extend(lens)
         x_num_list.extend(nums)
+        base_pred_list.extend(base_preds)
         meta_rows.extend(metas)
 
     X_seq = np.stack(sequences, axis=0).astype(np.float32) if sequences else np.zeros((0, seq_len, embeddings.shape[1]), dtype=np.float32)
     lengths_arr = np.array(lengths, dtype=np.int64)
-    X_num = np.stack(x_num_list, axis=0).astype(np.float32) if x_num_list else np.zeros((0, 10), dtype=np.float32)
-    meta = pd.DataFrame(meta_rows)
 
+    X_num = np.stack(x_num_list, axis=0).astype(np.float32) if x_num_list else np.zeros((0, n_feats), dtype=np.float32)
+    meta = pd.DataFrame(meta_rows)
+    base_pred = np.stack(base_pred_list, axis=0).astype(np.float32) if base_pred_list else np.zeros((0, 2), dtype=np.float32)
+
+    # normalize with train stats
     mean = np.asarray(norm_stats["mean"], dtype=np.float32)
     std = np.asarray(norm_stats["std"], dtype=np.float32)
+    if mean.shape[0] != X_num.shape[1] or std.shape[0] != X_num.shape[1]:
+        raise ValueError(
+            f"norm_stats mean/std dim mismatch: mean={mean.shape}, std={std.shape}, X_num={X_num.shape}"
+        )
     X_num = (X_num - mean) / std
+
     if ablate_no_history:
         X_num[:] = 0.0
+
+    # enforce: one row per anchor
     if len(meta) != len(anchors_df):
         missing = set(anchors_df["anchor_idx"].astype(int).tolist()) - set(
             meta["idx"].astype(int).tolist()
@@ -692,12 +955,19 @@ def build_subtask2a_anchor_features(
             f"Missing anchor_idx sample: {sample}"
         )
 
-    return {
+    out = {
         "X_seq": X_seq,
         "lengths": lengths_arr,
         "X_num": X_num,
+        "base_pred": base_pred,
         "meta": meta,
     }
+
+    if include_residual_targets:
+        y_true = meta[["state_change_valence", "state_change_arousal"]].to_numpy(dtype=np.float32)
+        out["y_resid"] = y_true - base_pred
+
+    return out
 
 
 class Subtask2ASequenceDataset(Dataset):
@@ -716,12 +986,28 @@ class Subtask2ASequenceDataset(Dataset):
         df: pd.DataFrame,
         embeddings: np.ndarray,
         seq_len: int = 5,
+        *,
+        include_numeric_features: bool = False,
+        use_residual_targets: bool = False,
     ) -> None:
         self.seq_len = seq_len
         self.embedding_dim = embeddings.shape[1]
-        df_sorted = df.sort_values(["user_id", "timestamp"], kind="stable").reset_index(drop=True)
+        self.include_numeric_features = include_numeric_features
+        self.use_residual_targets = use_residual_targets
 
-        self.samples: List[Tuple[np.ndarray, np.ndarray, int]] = []
+        if self.include_numeric_features or self.use_residual_targets:
+            missing = set(NUMERIC_FEATURE_COLS) - set(df.columns)
+            if missing:
+                raise ValueError(
+                    f"Missing numeric feature columns: {sorted(missing)}"
+                )
+
+        df_sorted = df.sort_values(
+            ["user_id", "timestamp", "text_id"], kind="mergesort"
+        ).reset_index(drop=True)
+
+        self.samples: List[Tuple[np.ndarray, ...]] = []
+        sanity_checked = False
 
         for _, group in df_sorted.groupby("user_id"):
             group = group.reset_index(drop=True)
@@ -741,23 +1027,66 @@ class Subtask2ASequenceDataset(Dataset):
                 seq = np.zeros((seq_len, self.embedding_dim), dtype=np.float32)
                 seq[self.seq_len - actual_len :] = embeddings[window_indices]
 
-                target = np.array(
-                    [dval[idx], dar[idx]],
-                    dtype=np.float32,
-                )
+                target_raw = np.array([dval[idx], dar[idx]], dtype=np.float32)
 
-                self.samples.append((seq, target, actual_len))
+                if self.include_numeric_features or self.use_residual_targets:
+                    row = group.iloc[idx]
+                    base_pred = np.array(
+                        [row["base_pred_dv"], row["base_pred_da"]],
+                        dtype=np.float32,
+                    )
+                    target_used = (
+                        target_raw - base_pred
+                        if self.use_residual_targets
+                        else target_raw
+                    )
+                    numeric_features = None
+                    if self.include_numeric_features:
+                        numeric_features = row[NUMERIC_FEATURE_COLS].to_numpy(
+                            dtype=np.float32
+                        )
+                    if not sanity_checked:
+                        if self.include_numeric_features and numeric_features is not None:
+                            assert len(numeric_features) == len(NUMERIC_FEATURE_COLS)
+                            assert np.isfinite(numeric_features).all()
+                        assert np.isfinite(target_raw).all()
+                        sanity_checked = True
+                    self.samples.append(
+                        (
+                            seq,
+                            target_used,
+                            target_raw,
+                            actual_len,
+                            numeric_features,
+                            base_pred,
+                        )
+                    )
+                else:
+                    self.samples.append((seq, target_raw, actual_len))
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
-        seq, target, length = self.samples[idx]
-        return {
+        if not (self.include_numeric_features or self.use_residual_targets):
+            seq, target, length = self.samples[idx]
+            return {
+                "inputs": torch.from_numpy(seq),
+                "target": torch.from_numpy(target),
+                "length": length,
+            }
+
+        seq, target, target_raw, length, numeric_features, base_pred = self.samples[idx]
+        out = {
             "inputs": torch.from_numpy(seq),
             "target": torch.from_numpy(target),
+            "target_raw": torch.from_numpy(target_raw),
+            "base_pred": torch.from_numpy(base_pred),
             "length": length,
         }
+        if self.include_numeric_features and numeric_features is not None:
+            out["numeric_features"] = torch.from_numpy(numeric_features)
+        return out
 
 
 def build_subtask2a_datasets(
@@ -767,6 +1096,8 @@ def build_subtask2a_datasets(
     split_mode: str = "random",
     split_path: Path | str | None = None,
     seed: int = 42,
+    include_numeric_features: bool = False,
+    use_residual_targets: bool = False,
 ) -> Tuple[Subtask2ASequenceDataset, Subtask2ASequenceDataset, int]:
     """
     Build train/validation datasets for Subtask 2A, splitting by user_id.
@@ -853,8 +1184,33 @@ def build_subtask2a_datasets(
         train_df = merged[merged["user_id"].isin(train_users)].copy()
         val_df = merged[merged["user_id"].isin(val_users)].copy()
 
-    train_dataset = Subtask2ASequenceDataset(train_df, embeddings, seq_len=seq_len)
-    val_dataset = Subtask2ASequenceDataset(val_df, embeddings, seq_len=seq_len)
+    if include_numeric_features or use_residual_targets:
+        # Canonical C2 attachment: fit baseline on TRAIN only, then apply to VAL
+        train_df, baseline_model = _attach_c2_features(
+            train_df,
+            baseline_model=None,
+            fit_baseline_on=train_df,
+        )
+        val_df, _ = _attach_c2_features(
+            val_df,
+            baseline_model=baseline_model,
+            fit_baseline_on=None,
+        )
+
+    train_dataset = Subtask2ASequenceDataset(
+        train_df,
+        embeddings,
+        seq_len=seq_len,
+        include_numeric_features=include_numeric_features,
+        use_residual_targets=use_residual_targets,
+    )
+    val_dataset = Subtask2ASequenceDataset(
+        val_df,
+        embeddings,
+        seq_len=seq_len,
+        include_numeric_features=include_numeric_features,
+        use_residual_targets=use_residual_targets,
+    )
     embedding_dim = embeddings.shape[1]
     return train_dataset, val_dataset, embedding_dim
 
@@ -863,7 +1219,16 @@ def collate_sequence_batch(batch: List[dict]) -> dict:
     inputs = torch.stack([b["inputs"] for b in batch], dim=0)
     targets = torch.stack([b["target"] for b in batch], dim=0)
     lengths = torch.tensor([b["length"] for b in batch], dtype=torch.long)
-    return {"inputs": inputs, "target": targets, "lengths": lengths}
+    out = {"inputs": inputs, "target": targets, "lengths": lengths}
+    if "numeric_features" in batch[0]:
+        out["numeric_features"] = torch.stack(
+            [b["numeric_features"] for b in batch], dim=0
+        )
+    if "target_raw" in batch[0]:
+        out["target_raw"] = torch.stack([b["target_raw"] for b in batch], dim=0)
+    if "base_pred" in batch[0]:
+        out["base_pred"] = torch.stack([b["base_pred"] for b in batch], dim=0)
+    return out
 
 
 def create_dataloaders(

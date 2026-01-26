@@ -153,6 +153,11 @@ def main() -> None:
     parser.add_argument("--arousal_loss_weight", type=float, default=1.0)
     parser.add_argument("--valence_loss", choices=["mse", "huber"], default="mse")
     parser.add_argument("--huber_delta", type=float, default=1.0)
+    parser.add_argument("--use_numeric_features", type=int, default=0)
+    parser.add_argument("--use_residual_targets", type=int, default=0)
+    parser.add_argument("--numeric_feature_dim", type=int, default=0)
+    parser.add_argument("--debug", type=int, default=0)
+    parser.add_argument("--smoke_batches", type=int, default=0)
     args = parser.parse_args()
 
     validate_run_id(args.run_id)
@@ -209,8 +214,11 @@ def main() -> None:
         fit_norm=True,
         norm_stats=None,
         ablate_no_history=bool(args.ablate_no_history),
+        use_residual_targets=bool(args.use_residual_targets),
     )
     norm_stats = train_bundle["norm_stats"]
+    if args.use_residual_targets and train_bundle.get("y_resid") is None:
+        raise SystemExit("Residual targets requested but not available in training bundle.")
 
     val_df_raw = df_raw.iloc[val_idx].copy()
     val_df_raw["idx"] = np.asarray(val_idx, dtype=int)
@@ -232,24 +240,36 @@ def main() -> None:
         k_state=args.k_state,
         norm_stats=norm_stats,
         ablate_no_history=bool(args.ablate_no_history),
+        include_residual_targets=bool(args.use_residual_targets),
     )
 
     train_loader = _make_loader(
         train_bundle["X_seq"],
         train_bundle["lengths"],
         train_bundle["X_num"],
-        train_bundle["y"],
+        train_bundle["y_resid"] if args.use_residual_targets else train_bundle["y"],
         batch_size=args.batch_size,
         shuffle=True,
         generator=generator,
     )
 
+    numeric_dim = (
+        int(args.numeric_feature_dim)
+        if args.numeric_feature_dim > 0
+        else int(train_bundle["X_num"].shape[1])
+    )
+    if int(train_bundle["X_num"].shape[1]) != numeric_dim:
+        raise SystemExit(
+            f"numeric_feature_dim mismatch: dataset has {train_bundle['X_num'].shape[1]}, "
+            f"but --numeric_feature_dim={numeric_dim}."
+        )
     model = SequenceStateRegressor(
         embedding_dim=train_bundle["X_seq"].shape[2],
-        num_features=train_bundle["X_num"].shape[1],
+        num_features=numeric_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
+        use_numeric_features=bool(args.use_numeric_features),
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -268,6 +288,7 @@ def main() -> None:
         total_loss_v = 0.0
         total_loss_a = 0.0
         total_count = 0
+        first_batch = True
         for x_seq, lengths, x_num, y in tqdm(
             train_loader, desc=f"Epoch {epoch}", unit="batch"
         ):
@@ -277,6 +298,14 @@ def main() -> None:
             y = y.to(device)
             optimizer.zero_grad()
             outputs = model(x_seq, lengths, x_num)
+            if args.debug and first_batch:
+                print(
+                    f"[debug] numeric_features shape={x_num.shape} "
+                    f"output shape={outputs.shape} target shape={y.shape} "
+                    f"nan_numeric={torch.isnan(x_num).any().item()} "
+                    f"nan_target={torch.isnan(y).any().item()}"
+                )
+                first_batch = False
             if outputs.shape[-1] != 2:
                 raise SystemExit("Model outputs must have shape (B, 2) for ΔV/ΔA.")
             pred_v = outputs[:, 0]
@@ -301,6 +330,8 @@ def main() -> None:
             total_loss_v += float(loss_v.item()) * len(x_seq)
             total_loss_a += float(loss_a.item()) * len(x_seq)
             total_count += len(x_seq)
+            if args.smoke_batches and total_count >= args.smoke_batches * args.batch_size:
+                break
 
         train_loss = total_loss / max(total_count, 1)
         train_loss_v = total_loss_v / max(total_count, 1)
@@ -308,6 +339,11 @@ def main() -> None:
         y_true_val = val_anchor_bundle["meta"][
             ["state_change_valence", "state_change_arousal"]
         ].to_numpy(dtype=float)
+        if args.use_residual_targets:
+            if val_anchor_bundle.get("y_resid") is not None:
+                y_true_val = val_anchor_bundle["y_resid"]
+            else:
+                raise SystemExit("Residual targets requested but not available in val anchor bundle.")
         r_v, r_a, val_loss = _eval_anchors(
             model,
             val_anchor_bundle["X_seq"],
@@ -354,7 +390,9 @@ def main() -> None:
                     "hidden_dim": args.hidden_dim,
                     "num_layers": args.num_layers,
                     "dropout": args.dropout,
-                    "num_features": train_bundle["X_num"].shape[1],
+                    "num_features": numeric_dim,
+                    "use_numeric_features": bool(args.use_numeric_features),
+                    "use_residual_targets": bool(args.use_residual_targets),
                     "embedding_dim": train_bundle["X_seq"].shape[2],
                     "ablate_no_history": bool(args.ablate_no_history),
                 },
@@ -423,6 +461,9 @@ def main() -> None:
                         "valence_loss": args.valence_loss,
                         "huber_delta": args.huber_delta,
                         "legacy_loss": legacy_loss,
+                        "use_numeric_features": bool(args.use_numeric_features),
+                        "use_residual_targets": bool(args.use_residual_targets),
+                        "numeric_feature_dim": int(numeric_dim),
                     }
                 }
             },
