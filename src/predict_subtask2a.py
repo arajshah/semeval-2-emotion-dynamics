@@ -140,15 +140,24 @@ def main() -> None:
         baseline_model = fit_linear_prev(train_feat)
 
         anchor_idxs = anchors_df["anchor_idx"].astype(int).drop_duplicates().to_numpy()
-        anchor_rows = df_feat.loc[anchor_idxs].reset_index()
 
-        anchor_rows = predict_linear_prev(
-            anchor_rows,
+        # IMPORTANT: compute prev-delta features on the full VAL rows (per user history),
+        # then pick the anchor rows.
+        val_rows = df_feat.loc[np.asarray(val_idx, dtype=int)].reset_index()
+
+        val_rows = predict_linear_prev(
+            val_rows,
             baseline_model,
             fill_value=0.0,
             out_v_col="delta_valence_pred",
             out_a_col="delta_arousal_pred",
         )
+
+        anchor_rows = val_rows[val_rows["idx"].isin(anchor_idxs)].copy()
+        assert (
+            anchor_rows["delta_valence_pred"].nunique() > 1
+            or anchor_rows["delta_arousal_pred"].nunique() > 1
+        ), "linear(prev) baseline degenerate: preds are (near) constant."
 
         out_df = pd.DataFrame(
             {
