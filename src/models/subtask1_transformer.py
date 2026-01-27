@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from transformers import AutoConfig, AutoModel, AutoTokenizer, PretrainedConfig, PreTrainedModel
+from transformers import AutoModel, AutoTokenizer, PretrainedConfig, PreTrainedModel
 
 
 def get_repo_root() -> Path:
@@ -174,19 +174,49 @@ def load_hf_checkpoint(
     out_dir: str | Path, model_name_fallback: str | None = None
 ) -> tuple[Subtask1Regressor, object]:
     out_dir = Path(out_dir)
+
+    # 1) Try the clean path: load the full saved model + config directly.
+    #    IMPORTANT: force-disable meta-device / device_map behavior.
     try:
-        model = Subtask1Regressor.from_pretrained(out_dir)
+        model = Subtask1Regressor.from_pretrained(
+            out_dir,
+            low_cpu_mem_usage=False,
+            device_map=None,
+        )
     except Exception:
-        config = AutoConfig.from_pretrained(out_dir)
-        model_name = model_name_fallback or config._name_or_path or str(out_dir)
-        dropout = getattr(config, "classifier_dropout", 0.1)
-        head_type = getattr(config, "head_type", "simple")
+        # 2) Fallback path: DO NOT use AutoConfig here (it can't resolve model_type=subtask1_regressor).
+        try:
+            cfg = Subtask1RegressorConfig.from_pretrained(out_dir)
+            model_name = cfg.model_name
+            dropout = getattr(cfg, "dropout", 0.1)
+            head_type = getattr(cfg, "head_type", "simple")
+        except Exception:
+            # Last-resort fallback if config load fails
+            model_name = model_name_fallback or str(out_dir)
+            dropout = 0.1
+            head_type = "simple"
+
         model_cfg = Subtask1RegressorConfig(
             model_name=model_name, dropout=dropout, head_type=head_type
         )
         model = Subtask1Regressor(model_cfg)
-        state_dict = torch.load(out_dir / "pytorch_model.bin", map_location="cpu")
-        model.load_state_dict(state_dict)
+
+        # Load weights (support both safetensors + pytorch bin)
+        safetensors_path = out_dir / "model.safetensors"
+        bin_path = out_dir / "pytorch_model.bin"
+
+        if safetensors_path.exists():
+            from safetensors.torch import load_file as safe_load_file
+            state_dict = safe_load_file(str(safetensors_path))
+        elif bin_path.exists():
+            state_dict = torch.load(bin_path, map_location="cpu")
+        else:
+            raise FileNotFoundError(
+                f"No weights found in {out_dir} (expected model.safetensors or pytorch_model.bin)"
+            )
+
+        model.load_state_dict(state_dict, strict=True)
+
     tokenizer = AutoTokenizer.from_pretrained(out_dir)
     return model, tokenizer
 
