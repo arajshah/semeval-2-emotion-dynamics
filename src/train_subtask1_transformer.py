@@ -17,9 +17,9 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from src.data_loader import load_all_data
 from src.eval.analysis_tools import (
     compute_subtask1_correlations,
-    load_frozen_split,
     make_seen_user_time_split,
 )
+from src.eval.splits import load_frozen_split
 from src.models.subtask1_transformer import (
     Subtask1Dataset,
     Subtask1Regressor,
