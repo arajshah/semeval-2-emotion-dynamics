@@ -135,11 +135,29 @@ class Subtask1Regressor(PreTrainedModel):
         outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
         pooled = outputs.last_hidden_state[:, 0]
         pooled = self.dropout(pooled)
+
+        # raw predictions (B, 2)
         if self.head_type == "simple":
-            return self.head(pooled)
-        level = self.level_head(pooled)
-        dev = self.dev_head(pooled)
-        return level + dev
+            raw = self.head(pooled)
+        else:
+            raw = self.level_head(pooled) + self.dev_head(pooled)
+
+        val = raw[:, 0]
+        aro_raw = raw[:, 1]
+
+        eps = 1e-6
+
+        # If you trained with --scale_arousal_to_valence_range:
+        #   arousal is represented in [-2, 2] during training/inference, then inverted later to [0, 2].
+        if getattr(self.config, "scale_arousal_to_valence_range", True):
+            aro = 2.0 * torch.tanh(aro_raw)                    # (-2, 2)
+            aro = torch.clamp(aro, -2.0 + eps, 2.0 - eps)      # avoid exact endpoints
+        else:
+            # If you ever run without scaling, predict arousal directly in (0, 2)
+            aro = 2.0 * torch.sigmoid(aro_raw)                 # (0, 2)
+            aro = torch.clamp(aro, 0.0 + eps, 2.0 - eps)
+
+        return torch.stack([val, aro], dim=1)
 
 
 def clip_preds(preds_np: np.ndarray) -> np.ndarray:
