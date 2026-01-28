@@ -31,6 +31,14 @@ NUMERIC_FEATURE_COLS = [
     "da_ema_prev",
     "base_pred_dv",
     "base_pred_da",
+    "v_curr",
+    "a_curr",
+    "v_curr_missing",
+    "a_curr_missing",
+    "v_prev_state",
+    "a_prev_state",
+    "v_prev_state_missing",
+    "a_prev_state_missing",
 ]
 
 def _linear_prev_from_stats(stats: Dict) -> LinearPrevModel:
@@ -57,6 +65,10 @@ def _finalize_numeric_feature_cols(df: pd.DataFrame) -> pd.DataFrame:
 
     out["dv_prev_missing"] = out["dv_prev"].isna()
     out["da_prev_missing"] = out["da_prev"].isna()
+    out["v_curr_missing"] = out["v_curr"].isna()
+    out["a_curr_missing"] = out["a_curr"].isna()
+    out["v_prev_state_missing"] = out["v_prev_state"].isna()
+    out["a_prev_state_missing"] = out["a_prev_state"].isna()
 
     # Fill required columns
     fill0 = [
@@ -70,6 +82,10 @@ def _finalize_numeric_feature_cols(df: pd.DataFrame) -> pd.DataFrame:
         "da_ema_prev",
         "base_pred_dv",
         "base_pred_da",
+        "v_curr",
+        "a_curr",
+        "v_prev_state",
+        "a_prev_state",
     ]
     for c in fill0:
         if c not in out.columns:
@@ -79,6 +95,10 @@ def _finalize_numeric_feature_cols(df: pd.DataFrame) -> pd.DataFrame:
     # Cast flags to 0/1 float
     out["dv_prev_missing"] = out["dv_prev_missing"].astype(np.float32)
     out["da_prev_missing"] = out["da_prev_missing"].astype(np.float32)
+    out["v_curr_missing"] = out["v_curr_missing"].astype(np.float32)
+    out["a_curr_missing"] = out["a_curr_missing"].astype(np.float32)
+    out["v_prev_state_missing"] = out["v_prev_state_missing"].astype(np.float32)
+    out["a_prev_state_missing"] = out["a_prev_state_missing"].astype(np.float32)
 
     # Cast everything in NUMERIC_FEATURE_COLS to float32
     for c in NUMERIC_FEATURE_COLS:
@@ -113,10 +133,13 @@ def _attach_c2_features(
     # 1) prev-delta features: based on *state_change_* history (not valence diffs)
     out = add_prev_delta_features(out)
 
-    # 2) history aggregates (deterministic)
+    # 2) state features: v/a at anchor + previous observed non-null v/a
+    out = _add_state_features(out)
+
+    # 3) history aggregates: dt_prev_seconds/history_len/running means/EMA
     out = _add_history_features(out)
 
-    # 3) baseline model: fit on TRAIN ONLY if not provided
+    # baseline model: fit on TRAIN ONLY if not provided
     if baseline_model is None:
         fit_df = fit_baseline_on if fit_baseline_on is not None else out
         baseline_model = fit_linear_prev(fit_df)
@@ -130,7 +153,7 @@ def _attach_c2_features(
         out_a_col="base_pred_da",
     )
 
-    # 4) finalize schema
+    # finalize NUMERIC_FEATURE_COLS as float32 + finite
     out = _finalize_numeric_feature_cols(out)
     return out, baseline_model
 
@@ -545,6 +568,33 @@ def select_forecast_anchors(
         raise RuntimeError("Forecast anchors must contain exactly one row per user.")
     return out
 
+def _add_state_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds per-row state features (valence/arousal) and previous observed non-null state per user.
+
+    Requires df to have:
+      - user_id
+      - valence, arousal
+      - already sorted by (user_id, timestamp, text_id) upstream for correct "prev" semantics
+    """
+    out = df.copy()
+
+    if "valence" not in out.columns or "arousal" not in out.columns:
+        raise ValueError("Expected columns valence/arousal to compute state features.")
+
+    # current/anchor state
+    out["v_curr"] = pd.to_numeric(out["valence"], errors="coerce")
+    out["a_curr"] = pd.to_numeric(out["arousal"], errors="coerce")
+    out["v_curr_missing"] = out["v_curr"].isna()
+    out["a_curr_missing"] = out["a_curr"].isna()
+
+    # previous observed non-null state (per user)
+    out["v_prev_state"] = out.groupby("user_id", sort=False)["v_curr"].transform(lambda s: s.ffill().shift(1))
+    out["a_prev_state"] = out.groupby("user_id", sort=False)["a_curr"].transform(lambda s: s.ffill().shift(1))
+    out["v_prev_state_missing"] = out["v_prev_state"].isna()
+    out["a_prev_state_missing"] = out["a_prev_state"].isna()
+
+    return out
 
 def _add_history_features(df: pd.DataFrame) -> pd.DataFrame:
     """

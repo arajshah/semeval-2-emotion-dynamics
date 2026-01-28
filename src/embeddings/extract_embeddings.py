@@ -304,10 +304,10 @@ def main() -> None:
     if args.task == "subtask2b":
         if not args.run_id:
             raise SystemExit("--run_id is required for subtask2b embeddings.")
-        if args.model_name != "microsoft/deberta-v3-base" or args.max_length != 256:
-            raise SystemExit(
-                "Subtask2b embeddings require --model_name microsoft/deberta-v3-base and --max_length 256."
-            )
+        # Allow other encoders (e.g., ModernBERT) for experimentation.
+        # Keep DeBERTa-256 as the recommended default.
+        if args.model_name == "microsoft/deberta-v3-base" and args.max_length != 256:
+            raise SystemExit("For microsoft/deberta-v3-base, max_length must be 256 (repo default).")
         if args.device.startswith("cuda") and not torch.cuda.is_available():
             raise SystemExit("CUDA requested but torch.cuda.is_available() is False.")
 
