@@ -70,7 +70,7 @@ def main() -> None:
 
     data = load_all_data()
     df_text_raw = data["subtask2b"]
-    df_user_raw = data["subtask2b_user_disposition_change"]
+    df_user_raw = data["subtask2b_user"]
 
     emb_map_df, emb_arr = load_subtask2b_embeddings_npz(args.emb_path)
     embeddings = (emb_map_df, emb_arr)
