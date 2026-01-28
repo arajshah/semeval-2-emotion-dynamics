@@ -243,10 +243,8 @@ def main() -> None:
     if args.task == "subtask2a":
         if not args.run_id:
             raise SystemExit("--run_id is required for subtask2a embeddings.")
-        if args.model_name != "microsoft/deberta-v3-base" or args.max_length != 256:
-            raise SystemExit(
-                "Subtask2a embeddings require --model_name microsoft/deberta-v3-base and --max_length 256."
-            )
+        if args.model_name == "microsoft/deberta-v3-base" and args.max_length != 256:
+            raise SystemExit("For microsoft/deberta-v3-base, max_length must be 256 (repo default).")
 
         data = load_all_data(data_dir=str(repo_root / "data" / "raw"))
         df_raw = data["subtask2a"].copy()
