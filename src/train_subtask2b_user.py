@@ -125,7 +125,7 @@ def main() -> None:
             "env": get_env_snapshot(),
         },
     )
-    df_user_raw = data["subtask2b_user_disposition_change"]
+    df_user_raw = data["subtask2b_user"]
     df_text_raw = data["subtask2b"]
 
     if args.audit_labels:
