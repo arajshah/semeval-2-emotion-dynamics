@@ -222,6 +222,111 @@ def main() -> None:
                 },
             },
         )
+        
+        if args.write_forecast:
+            if not args.forecast_cutoff_path and not args.forecast_marker_path:
+                raise SystemExit(
+                    "Provide --forecast_cutoff_path (preferred; test_subtask2.csv) or "
+                    "--forecast_marker_path when --write_forecast 1."
+                )
+
+            cutoff_df = None
+            if args.forecast_cutoff_path:
+                cutoff_path = Path(args.forecast_cutoff_path)
+                if not cutoff_path.is_absolute():
+                    cutoff_path = repo_root / cutoff_path
+                if not cutoff_path.exists():
+                    raise SystemExit(f"Forecast cutoff file not found: {cutoff_path}")
+                cutoff_df = pd.read_csv(cutoff_path)
+                if "user_id" not in cutoff_df.columns or "timestamp_min" not in cutoff_df.columns:
+                    raise SystemExit(
+                        f"Cutoff file must have columns user_id,timestamp_min. Got: {list(cutoff_df.columns)}"
+                    )
+
+            marker_df = None
+            if args.forecast_marker_path:
+                marker_path = Path(args.forecast_marker_path)
+                if not marker_path.is_absolute():
+                    marker_path = repo_root / marker_path
+                if not marker_path.exists():
+                    raise SystemExit(f"Forecast marker file not found: {marker_path}")
+                marker_df = pd.read_csv(marker_path)
+
+            forecast_anchors = select_forecast_anchors(
+                df_raw=df_raw,
+                marker_df=(marker_df if marker_df is not None else pd.DataFrame(columns=["user_id"])),
+                cutoff_df=cutoff_df,
+            )
+            if forecast_anchors.empty:
+                raise SystemExit("No forecast anchors found (baseline).")
+
+            forecast_anchor_idxs = (
+                forecast_anchors["anchor_idx"].astype(int).drop_duplicates().to_numpy()
+            )
+
+            forecast_rows = df_feat.loc[forecast_anchor_idxs].reset_index()
+
+            forecast_rows = predict_linear_prev(
+                forecast_rows,
+                baseline_model,
+                fill_value=0.0,
+                out_v_col="delta_valence_pred",
+                out_a_col="delta_arousal_pred",
+            )
+
+            forecast_df = pd.DataFrame(
+                {
+                    "run_id": args.run_id,
+                    "seed": int(args.seed),
+                    "user_id": forecast_rows["user_id"].to_numpy(),
+                    "anchor_idx": forecast_rows["idx"].to_numpy(),
+                    "anchor_text_id": forecast_rows["text_id"].to_numpy(),
+                    "anchor_timestamp": forecast_rows["timestamp"].to_numpy(),
+                    "delta_valence_pred": forecast_rows["delta_valence_pred"].to_numpy(dtype=float),
+                    "delta_arousal_pred": forecast_rows["delta_arousal_pred"].to_numpy(dtype=float),
+                }
+            )
+            if forecast_df["user_id"].duplicated().any():
+                raise SystemExit("Forecast preds must contain exactly one row per user (baseline).")
+            if forecast_df[["delta_valence_pred", "delta_arousal_pred"]].isna().any().any():
+                raise SystemExit("Baseline forecast contains missing prediction values.")
+            if not np.isfinite(forecast_df[["delta_valence_pred", "delta_arousal_pred"]].to_numpy()).all():
+                raise SystemExit("Baseline forecast contains non-finite prediction values.")
+
+            forecast_path = preds_dir / f"subtask2a_forecast_user_preds__{args.run_id}.parquet"
+            forecast_df.to_parquet(forecast_path, index=False)
+            print(f"Wrote BASELINE forecast preds to: {forecast_path}")
+
+            merge_run_metadata(
+                repo_root=repo_root,
+                run_id=args.run_id,
+                updates={
+                    "artifacts": {"preds_forecast_user": artifact_ref(forecast_path, repo_root)},
+                    "counts": {"n_forecast_users_pred": int(len(forecast_df))},
+                    "config": {
+                        "predict": {
+                            "subtask2a": {
+                                "pred_kind": "forecast",
+                                "pred_path": str(forecast_path),
+                                "baseline": "linear_prev",
+                            }
+                        }
+                    },
+                    "diagnostics": {
+                        "predict": {
+                            "subtask2a": {
+                                "forecast": summarize_pred_df(
+                                    forecast_df,
+                                    pred_cols={"valence": "delta_valence_pred", "arousal": "delta_arousal_pred"},
+                                    true_cols=None,
+                                    bounds={"valence": (-4.0, 4.0), "arousal": (-2.0, 2.0)},
+                                )
+                            }
+                        }
+                    },
+                },
+            )
+
         return
 
     assert model_path is not None, "Internal error: model_path must be set when not in baseline mode."

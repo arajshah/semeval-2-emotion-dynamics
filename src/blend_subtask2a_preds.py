@@ -3,148 +3,140 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
-REQUIRED_COLS = [
-    "user_id",
-    "anchor_idx",
-    "anchor_text_id",
-    "anchor_timestamp",
-    "delta_valence_pred",
-    "delta_arousal_pred",
-    "delta_valence_true",
-    "delta_arousal_true",
-]
+def _pick(df: pd.DataFrame, cols: list[str]) -> str:
+    for c in cols:
+        if c in df.columns:
+            return c
+    raise KeyError(f"None of these columns exist: {cols}. Have: {list(df.columns)}")
 
 
-def _parse_key_cols(value: str) -> list[str]:
-    cols = [c.strip() for c in value.split(",") if c.strip()]
-    if not cols:
-        raise ValueError("--key_cols must contain at least one column name.")
-    return cols
+def _standardize_forecast(df: pd.DataFrame, *, label: str) -> pd.DataFrame:
+    df = df.copy()
 
+    uid_col = _pick(df, ["user_id"])
+    df[uid_col] = df[uid_col].astype(str)
 
-def _check_required_cols(df: pd.DataFrame, path: Path) -> None:
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in {path}: {missing}")
+    v_col = _pick(df, ["delta_valence_pred", "pred_state_change_valence"])
+    a_col = _pick(df, ["delta_arousal_pred", "pred_state_change_arousal"])
 
+    keep_cols = ["user_id"]
+    for c in ["anchor_idx", "anchor_text_id", "anchor_timestamp", "seed", "run_id"]:
+        if c in df.columns:
+            keep_cols.append(c)
 
-def _check_unique_keys(df: pd.DataFrame, key_cols: list[str], path: Path) -> None:
-    dup = df.duplicated(subset=key_cols, keep=False)
-    if dup.any():
-        sample = df.loc[dup, key_cols].head(5).to_dict(orient="records")
-        raise ValueError(f"Duplicate keys in {path} for {key_cols}: sample={sample}")
+    out = df[keep_cols + [v_col, a_col]].rename(
+        columns={v_col: "delta_valence_pred", a_col: "delta_arousal_pred"}
+    )
+
+    if "anchor_timestamp" in out.columns:
+        out["anchor_timestamp"] = pd.to_datetime(out["anchor_timestamp"], errors="coerce")
+
+    if out["user_id"].duplicated().any():
+        dup = out.loc[out["user_id"].duplicated(), "user_id"].iloc[0]
+        raise SystemExit(
+            f"{label} forecast has duplicate user_id rows (example: {dup}). Must be 1 row/user."
+        )
+
+    return out
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Blend Subtask 2A preds toward a baseline.")
-    parser.add_argument("--pred_a", required=True, type=str)
-    parser.add_argument("--pred_b", required=True, type=str)
-    parser.add_argument("--alpha_valence", required=True, type=float)
-    parser.add_argument("--alpha_arousal", required=True, type=float)
-    parser.add_argument("--out_path", required=True, type=str)
-    parser.add_argument("--key_cols", type=str, default="user_id,anchor_idx")
-    parser.add_argument(
-        "--strict",
-        default=True,
-        action=argparse.BooleanOptionalAction,
-        help="Error on any mismatch/duplicate keys/row drops.",
+    parser = argparse.ArgumentParser(
+        description="Blend Subtask 2A forecast parquets (baseline + model) and write blended forecast parquet."
     )
+    parser.add_argument("--baseline_run_id", required=True)
+    parser.add_argument("--model_run_id", required=True)
+    parser.add_argument("--alpha_valence", type=float, required=True)
+    parser.add_argument("--alpha_arousal", type=float, required=True)
+
+    parser.add_argument("--repo_root", default=".")
+    parser.add_argument("--preds_dir", default=None)
+    parser.add_argument("--blend_run_id", default=None)
+    parser.add_argument("--out_path", default=None)
+
     args = parser.parse_args()
 
     if not (0.0 <= args.alpha_valence <= 1.0):
-        raise ValueError("--alpha_valence must be in [0,1].")
+        raise SystemExit("--alpha_valence must be in [0, 1].")
     if not (0.0 <= args.alpha_arousal <= 1.0):
-        raise ValueError("--alpha_arousal must be in [0,1].")
+        raise SystemExit("--alpha_arousal must be in [0, 1].")
 
-    pred_a = Path(args.pred_a)
-    pred_b = Path(args.pred_b)
-    out_path = Path(args.out_path)
-    key_cols = _parse_key_cols(args.key_cols)
+    repo_root = Path(args.repo_root).resolve()
+    if not repo_root.exists():
+        raise SystemExit(f"Missing repo_root: {repo_root}")
 
-    if args.strict:
-        forbidden = {
-            "anchor_text_id",
-            "anchor_timestamp",
-            "delta_valence_true",
-            "delta_arousal_true",
+    preds_dir = Path(args.preds_dir).resolve() if args.preds_dir else (repo_root / "reports" / "preds")
+    preds_dir.mkdir(parents=True, exist_ok=True)
+
+    baseline_path = preds_dir / f"subtask2a_forecast_user_preds__{args.baseline_run_id}.parquet"
+    model_path = preds_dir / f"subtask2a_forecast_user_preds__{args.model_run_id}.parquet"
+    if not baseline_path.exists():
+        raise SystemExit(f"Missing baseline forecast parquet: {baseline_path}")
+    if not model_path.exists():
+        raise SystemExit(f"Missing model forecast parquet: {model_path}")
+
+    av_tag = f"{args.alpha_valence:.2f}".replace(".", "p")
+    aa_tag = f"{args.alpha_arousal:.2f}".replace(".", "p")
+    blend_run_id = (
+        args.blend_run_id
+        or f"subtask2a_blend_linprev__{args.model_run_id}__av{av_tag}_aa{aa_tag}"
+    )
+
+    out_path = (
+        Path(args.out_path).resolve()
+        if args.out_path
+        else preds_dir / f"subtask2a_forecast_user_preds__{blend_run_id}.parquet"
+    )
+
+    df_base = _standardize_forecast(pd.read_parquet(baseline_path), label="BASELINE")
+    df_model = _standardize_forecast(pd.read_parquet(model_path), label="MODEL")
+
+    base_preds = df_base[["user_id", "delta_valence_pred", "delta_arousal_pred"]].rename(
+        columns={
+            "delta_valence_pred": "delta_valence_pred_base",
+            "delta_arousal_pred": "delta_arousal_pred_base",
         }
-        bad = [c for c in key_cols if c in forbidden]
-        if bad:
-            raise ValueError(
-                f"In strict mode, --key_cols must NOT include {sorted(forbidden)}. "
-                f"Found forbidden key cols: {bad}. "
-                "Use stable identifiers like 'user_id,anchor_idx' (recommended)."
-            )
+    )
 
-    df_a = pd.read_parquet(pred_a)
-    df_b = pd.read_parquet(pred_b)
+    merged = df_model.merge(base_preds, on="user_id", how="inner")
+    if len(merged) != len(df_model) or len(merged) != len(df_base):
+        raise SystemExit(
+            f"Alignment mismatch during blending: merged={len(merged)} model={len(df_model)} base={len(df_base)}"
+        )
 
-    _check_required_cols(df_a, pred_a)
-    _check_required_cols(df_b, pred_b)
+    mv = merged["delta_valence_pred"].to_numpy(dtype=float)
+    ma = merged["delta_arousal_pred"].to_numpy(dtype=float)
+    bv = merged["delta_valence_pred_base"].to_numpy(dtype=float)
+    ba = merged["delta_arousal_pred_base"].to_numpy(dtype=float)
 
-    _check_unique_keys(df_a, key_cols, pred_a)
-    _check_unique_keys(df_b, key_cols, pred_b)
+    blend_v = args.alpha_valence * mv + (1.0 - args.alpha_valence) * bv
+    blend_a = args.alpha_arousal * ma + (1.0 - args.alpha_arousal) * ba
 
-    merged = df_a.merge(df_b, on=key_cols, how="inner", suffixes=("_a", "_b"))
-
-    if args.strict:
-        if len(merged) != len(df_a) or len(merged) != len(df_b):
-            raise ValueError(
-                f"Strict alignment failed: merged={len(merged)} a={len(df_a)} b={len(df_b)}"
-            )
-    else:
-        if len(merged) != len(df_a) or len(merged) != len(df_b):
-            print(
-                f"WARNING: rowcount mismatch: merged={len(merged)} a={len(df_a)} b={len(df_b)}"
-            )
-
-    if args.strict:
-        ts_a_dt = pd.to_datetime(merged["anchor_timestamp_a"], utc=True, errors="raise")
-        ts_b_dt = pd.to_datetime(merged["anchor_timestamp_b"], utc=True, errors="raise")
-        if not (ts_a_dt.view("int64") == ts_b_dt.view("int64")).all():
-            raise ValueError(
-                "Strict mismatch in anchor_timestamp between A and B (after UTC normalization)."
-            )
-
-        text_a = merged["anchor_text_id_a"].astype("string")
-        text_b = merged["anchor_text_id_b"].astype("string")
-        if not text_a.equals(text_b):
-            raise ValueError("Strict mismatch in anchor_text_id between A and B.")
-
-        for col in ["delta_valence_true", "delta_arousal_true"]:
-            a = pd.to_numeric(merged[f"{col}_a"], errors="raise")
-            b = pd.to_numeric(merged[f"{col}_b"], errors="raise")
-            if not a.equals(b):
-                raise ValueError(f"Strict mismatch in {col} between A and B.")
-
-    anchor_timestamp_out = ts_a_dt.dt.strftime("%Y-%m-%dT%H:%M:%S%z").astype("string")
+    if not np.isfinite(blend_v).all() or not np.isfinite(blend_a).all():
+        raise SystemExit("Blended forecast contains non-finite values (NaN/inf).")
 
     out_df = pd.DataFrame(
         {
-            "user_id": merged["user_id"].astype("string"),
-            "anchor_idx": pd.to_numeric(merged["anchor_idx"], errors="raise").astype("int64"),
-            "anchor_text_id": merged["anchor_text_id_a"].astype("string"),
-            "anchor_timestamp": anchor_timestamp_out,
-            "delta_valence_true": pd.to_numeric(merged["delta_valence_true_a"], errors="raise"),
-            "delta_arousal_true": pd.to_numeric(merged["delta_arousal_true_a"], errors="raise"),
-            "delta_valence_pred": args.alpha_valence * merged["delta_valence_pred_a"]
-            + (1.0 - args.alpha_valence) * merged["delta_valence_pred_b"],
-            "delta_arousal_pred": args.alpha_arousal * merged["delta_arousal_pred_a"]
-            + (1.0 - args.alpha_arousal) * merged["delta_arousal_pred_b"],
+            "run_id": blend_run_id,
+            "seed": int(df_model["seed"].iloc[0]) if "seed" in df_model.columns else 42,
+            "user_id": merged["user_id"].astype(str).to_numpy(),
+            **({"anchor_idx": merged["anchor_idx"].to_numpy()} if "anchor_idx" in merged.columns else {}),
+            **({"anchor_text_id": merged["anchor_text_id"].to_numpy()} if "anchor_text_id" in merged.columns else {}),
+            **({"anchor_timestamp": merged["anchor_timestamp"].to_numpy()} if "anchor_timestamp" in merged.columns else {}),
+            "delta_valence_pred": blend_v,
+            "delta_arousal_pred": blend_a,
         }
     )
 
+    if out_df["user_id"].duplicated().any():
+        raise SystemExit("Blended forecast must contain exactly one row per user (duplicates found).")
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_parquet(out_path, index=False)
-
-    print(
-        f"Blended preds: n_rows={len(out_df)} "
-        f"alpha_valence={args.alpha_valence} alpha_arousal={args.alpha_arousal} "
-        f"key_cols={key_cols} out_path={out_path}"
-    )
 
 
 if __name__ == "__main__":
