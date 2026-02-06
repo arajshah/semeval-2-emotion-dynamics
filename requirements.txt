@@ -4,11 +4,17 @@ numpy
 pandas
 scikit-learn
 matplotlib
-sentence-transformers
-torch
-transformers
-tqdm
+scipy
 pyarrow
+tqdm
 jupyter
 ipykernel
-scipy
+
+torch
+
+# Keep transformers in 4.x (sentence-transformers depends on transformers<5)
+transformers>=4.48.0,<5.0.0
+tokenizers>=0.19.0,<0.22.0
+huggingface-hub>=0.23.0,<1.0.0
+
+sentence-transformers

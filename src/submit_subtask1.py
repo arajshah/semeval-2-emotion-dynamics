@@ -24,7 +24,6 @@ def _resolve_path(path: str | Path) -> Path:
 
 
 def _to_bool(x):
-    # Matches the Colab gate behavior exactly.
     if isinstance(x, bool):
         return x
     if isinstance(x, (int, np.integer)):
@@ -36,7 +35,7 @@ def _to_bool(x):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Write Subtask 1 test submission CSV from a trained checkpoint (matches Colab gates)."
+        description="Write Subtask 1 test submission CSV from a trained checkpoint."
     )
     parser.add_argument("--run_id", required=True)
     parser.add_argument(
@@ -66,7 +65,7 @@ def main() -> None:
         "--expected_rows",
         type=int,
         default=1737,
-        help="Expected number of rows in test_subtask1.csv (Colab gate used 1737).",
+        help="Expected number of rows in test_subtask1.csv.",
     )
     parser.add_argument("--overwrite", type=int, default=0)
     args = parser.parse_args()
