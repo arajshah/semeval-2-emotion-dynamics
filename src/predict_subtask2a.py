@@ -264,28 +264,65 @@ def main() -> None:
                 forecast_anchors["anchor_idx"].astype(int).drop_duplicates().to_numpy()
             )
 
-            forecast_rows = df_feat.loc[forecast_anchor_idxs].reset_index()
+            df_feat = df_raw.copy()
+            df_feat["user_id"] = df_feat["user_id"].astype(str)
+            df_feat["text_id"] = df_feat["text_id"].astype(str)
+            df_feat["timestamp"] = pd.to_datetime(df_feat["timestamp"], errors="raise")
 
-            forecast_rows = predict_linear_prev(
-                forecast_rows,
-                baseline_model,
-                fill_value=0.0,
-                out_v_col="delta_valence_pred",
-                out_a_col="delta_arousal_pred",
+            df_feat = df_feat.sort_values(["user_id", "timestamp"]).copy()
+            df_feat["prev_dv"] = df_feat.groupby("user_id")["state_change_valence"].shift(1)
+            df_feat["prev_da"] = df_feat.groupby("user_id")["state_change_arousal"].shift(1)
+
+            # 2) Train split rows (indices refer to df_raw as-loaded)
+            df_train = df_feat.loc[np.asarray(train_idx, dtype=int)].copy()
+
+            def fit_lstsq_1d(prev_col: str, y_col: str) -> np.ndarray:
+                tmp = df_train[[prev_col, y_col]].dropna()
+                if len(tmp) < 50:
+                    raise SystemExit(
+                        f"Too few training rows after dropping NaNs for {y_col}: {len(tmp)}"
+                    )
+                X = np.c_[np.ones(len(tmp)), tmp[prev_col].to_numpy(dtype=float)]
+                y = tmp[y_col].to_numpy(dtype=float)
+                beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+                return beta  # (2,) intercept + slope
+
+            betaV = fit_lstsq_1d("prev_dv", "state_change_valence")
+            betaA = fit_lstsq_1d("prev_da", "state_change_arousal")
+
+            # 3) Forecast anchors: compute preds using anchor rows’ prev features
+            forecast_anchor_idxs = (
+                forecast_anchors["anchor_idx"].astype(int).drop_duplicates().to_numpy()
             )
+
+            anc = df_feat.loc[forecast_anchor_idxs].copy()
+
+            if len(anc) != len(forecast_anchor_idxs):
+                raise SystemExit("Anchor index lookup mismatch (baseline).")
+
+            if "user_id" in forecast_anchors.columns:
+                if set(anc["user_id"].astype(str)) != set(forecast_anchors["user_id"].astype(str)):
+                    raise SystemExit("Anchor index->row mapping mismatch vs forecast_anchors users (baseline).")
+
+            anc["prev_dv"] = anc["prev_dv"].astype(float).fillna(0.0)
+            anc["prev_da"] = anc["prev_da"].astype(float).fillna(0.0)
+
+            anc["delta_valence_pred"] = betaV[0] + betaV[1] * anc["prev_dv"]
+            anc["delta_arousal_pred"] = betaA[0] + betaA[1] * anc["prev_da"]
 
             forecast_df = pd.DataFrame(
                 {
                     "run_id": args.run_id,
                     "seed": int(args.seed),
-                    "user_id": forecast_rows["user_id"].to_numpy(),
-                    "anchor_idx": forecast_rows["idx"].to_numpy(),
-                    "anchor_text_id": forecast_rows["text_id"].to_numpy(),
-                    "anchor_timestamp": forecast_rows["timestamp"].to_numpy(),
-                    "delta_valence_pred": forecast_rows["delta_valence_pred"].to_numpy(dtype=float),
-                    "delta_arousal_pred": forecast_rows["delta_arousal_pred"].to_numpy(dtype=float),
+                    "user_id": anc["user_id"].to_numpy(),
+                    "anchor_idx": anc.index.to_numpy(),  # original row index
+                    "anchor_text_id": anc["text_id"].to_numpy(),
+                    "anchor_timestamp": anc["timestamp"].to_numpy(),
+                    "delta_valence_pred": anc["delta_valence_pred"].to_numpy(dtype=float),
+                    "delta_arousal_pred": anc["delta_arousal_pred"].to_numpy(dtype=float),
                 }
             )
+
             if forecast_df["user_id"].duplicated().any():
                 raise SystemExit("Forecast preds must contain exactly one row per user (baseline).")
             if forecast_df[["delta_valence_pred", "delta_arousal_pred"]].isna().any().any():
