@@ -1,3 +1,9 @@
+"""Predict Subtask 2B with a trained ridge model on held-out users.
+
+Loads the frozen unseen-user split and the saved model, then writes one
+prediction row per validation user to reports/preds/.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -17,6 +23,11 @@ from src.subtask2b_features import (
 
 
 def _load_split_indices(path: Path) -> tuple[list[int], list[int]]:
+    """Load train/validation user indices from a frozen split JSON.
+
+    Accepts the train_indices/val_indices, train_idx/val_idx, or
+    train/val key spellings.
+    """
     payload = json.loads(path.read_text())
     for train_key, val_key in [
         ("train_indices", "val_indices"),

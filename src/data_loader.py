@@ -1,3 +1,9 @@
+"""Load and validate the SemEval 2026 Task 2 training CSVs.
+
+Each loader returns normalized DataFrames with the expected columns,
+sorted by user and timestamp, with valence/arousal values sanity-checked.
+"""
+
 from pathlib import Path
 from typing import Dict
 import math
@@ -77,7 +83,7 @@ EXPECTED_COLUMNS: Dict[str, list[str]] = {
 
 def _validate_columns(df: pd.DataFrame, expected_cols: list[str], name: str) -> None:
     """
-    Ensure that `df` has exactly the expected columns (at least these columns).
+    Ensure `df` contains at least the expected columns.
     Raise a ValueError with a clear message if any are missing.
     """
     missing = [col for col in expected_cols if col not in df.columns]
@@ -217,4 +223,3 @@ def print_data_summary(data: DataBundle) -> None:
 if __name__ == "__main__":
     data = load_all_data()
     print_data_summary(data)
-

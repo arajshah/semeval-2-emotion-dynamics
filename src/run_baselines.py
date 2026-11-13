@@ -1,3 +1,9 @@
+"""Run simple baselines for SemEval 2026 Task 2.
+
+Covers Subtask 1 (global mean and TF-IDF + Ridge), Subtask 2A (zero
+state-change), and Subtask 2B (global mean disposition change).
+"""
+
 from __future__ import annotations
 
 from typing import Tuple
@@ -110,6 +116,8 @@ def run_subtask2b_baseline(df_user: pd.DataFrame) -> None:
 
 
 def main() -> None:
+    """Load the data and run the baseline for each subtask in turn."""
+
     data = load_all_data()
     print_data_summary(data)
 
@@ -125,4 +133,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

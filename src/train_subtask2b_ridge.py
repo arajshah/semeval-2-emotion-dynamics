@@ -1,3 +1,9 @@
+"""Train the Subtask 2B ridge baseline on user-level embeddings.
+
+Fits a ridge model on the frozen unseen-user training split and saves it
+with run metadata under models/subtask2b_user/runs/<run_id>/.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -20,6 +26,11 @@ from src.utils.provenance import merge_run_metadata
 
 
 def _load_split_indices(path: Path) -> tuple[list[int], list[int]]:
+    """Load train/validation user indices from a frozen split JSON.
+
+    Accepts the train_indices/val_indices, train_idx/val_idx, or
+    train/val key spellings.
+    """
     payload = json.loads(path.read_text())
     for train_key, val_key in [
         ("train_indices", "val_indices"),
