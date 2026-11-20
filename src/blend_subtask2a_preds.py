@@ -1,3 +1,8 @@
+"""Blend Subtask 2A forecast parquets into one blended forecast.
+
+Combines a baseline forecast and a model forecast per user with per-dimension weights (alpha_valence, alpha_arousal), validates that each forecast has exactly one row per user, and writes the blended forecast as a parquet file.
+"""
+
 from __future__ import annotations
 
 import argparse
