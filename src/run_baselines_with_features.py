@@ -1,3 +1,5 @@
+"""Train Ridge baselines on TF-IDF plus handcrafted features for Subtask 1."""
+
 from __future__ import annotations
 
 from pathlib import Path
