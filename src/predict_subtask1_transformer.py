@@ -1,3 +1,5 @@
+"""Predict valence and arousal for Subtask 1 with a trained transformer model."""
+
 from __future__ import annotations
 
 import argparse
