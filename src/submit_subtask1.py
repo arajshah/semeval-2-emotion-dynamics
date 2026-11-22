@@ -1,3 +1,5 @@
+"""Write the Subtask 1 predictions out as a submission file."""
+
 from __future__ import annotations
 
 import argparse
