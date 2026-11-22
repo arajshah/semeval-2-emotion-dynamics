@@ -1,3 +1,5 @@
+"""Train an embedding-based Ridge regressor for Subtask 1 valence and arousal."""
+
 from __future__ import annotations
 
 from pathlib import Path
