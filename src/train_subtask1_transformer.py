@@ -1,3 +1,10 @@
+"""Train the Subtask 1 transformer regressor on valence and arousal.
+
+Fine-tunes a Hugging Face transformer on the frozen seen-user split with
+mixed precision and a linear warmup schedule, saving checkpoints and run
+metadata for later prediction.
+"""
+
 from __future__ import annotations
 
 import argparse
