@@ -1,3 +1,9 @@
+"""Build the Subtask 2B submission CSV from ridge-model predictions.
+
+Averages each validation user's first-half embeddings, pairs them with
+their mean valence and arousal, and writes one prediction row per user.
+"""
+
 from __future__ import annotations
 
 import argparse
