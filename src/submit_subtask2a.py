@@ -1,3 +1,9 @@
+"""Build the Subtask 2A submission CSV from forecast predictions.
+
+Reads the forecast preds parquet for a run, merges run metadata, and
+writes the submission file, clipping predictions to bounds when asked.
+"""
+
 from __future__ import annotations
 
 import argparse
