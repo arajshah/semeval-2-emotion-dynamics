@@ -1,3 +1,9 @@
+"""Compare Subtask 1 models with K-fold cross-validation.
+
+Runs TF-IDF + Ridge, random forest, and related baselines over the frozen
+splits and reports per-fold MAE and MSE for valence and arousal.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
