@@ -1,3 +1,9 @@
+"""Build per-user features for Subtask 2B disposition-change prediction.
+
+Splits each user's texts into first and second halves, loads their
+embeddings, and merges both into the feature rows the ridge model trains on.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
