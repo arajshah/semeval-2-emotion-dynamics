@@ -1,3 +1,9 @@
+"""Predict Subtask 2A emotion trajectories from a trained checkpoint.
+
+Loads a saved sequence-state model, runs it over the frozen validation
+split, and writes per-user valence/arousal forecasts for scoring.
+"""
+
 from __future__ import annotations
 
 import argparse
